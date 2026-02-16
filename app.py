@@ -26,20 +26,45 @@ for key, val in defaults.items():
 
 
 # ─────────────────────────────────────────────
+# Date patterns
+# ─────────────────────────────────────────────
+DATE_PATTERNS = [
+    # 15 Jan 2025, 15 January 2025
+    r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
+    # Jan 15, 2025 / January 15, 2025
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
+    # 2025-01-15
+    r'\d{4}-\d{2}-\d{2}',
+    # 15/01/2025 or 01/15/2025
+    r'\d{1,2}/\d{1,2}/\d{4}',
+    # 15-01-2025 or 01-15-2025
+    r'\d{1,2}-\d{1,2}-\d{4}',
+    # 15.01.2025
+    r'\d{1,2}\.\d{1,2}\.\d{4}',
+    # March 2025
+    r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
+    # Q1 2025, Q2 FY2025
+    r'Q[1-4]\s*(?:FY)?\s*\d{4}',
+    # FY 2024-25
+    r'FY\s*\d{4}(?:-\d{2,4})?',
+    # 2024-25
+    r'\d{4}-\d{2,4}',
+]
+
+DATE_REGEX = re.compile(
+    '(' + '|'.join(DATE_PATTERNS) + ')',
+    re.IGNORECASE
+)
+
+
+# ─────────────────────────────────────────────
 # Unescape JSON string
 # ─────────────────────────────────────────────
 def unescape_json_string(text):
-    """
-    HAR stores response bodies as JSON string values.
-    HTML like <a href="url"> becomes <a href=\\\"url\\\">
-    This reverses ALL escaping.
-    """
     if not text or not isinstance(text, str):
         return ""
 
     s = text
-
-    # Unicode escapes
     s = s.replace('\\u003c', '<')
     s = s.replace('\\u003e', '>')
     s = s.replace('\\u0026', '&')
@@ -47,7 +72,6 @@ def unescape_json_string(text):
     s = s.replace('\\u0022', '"')
     s = s.replace('\\u0027', "'")
 
-    # JSON string escapes (multiple passes)
     for _ in range(5):
         old = s
         s = s.replace('\\"', '"')
@@ -60,12 +84,9 @@ def unescape_json_string(text):
             break
 
     s = re.sub(r'\\+/', '/', s)
-
-    # Remove wrapping quotes
     s = s.strip()
     if s.startswith('"') and s.endswith('"'):
         s = s[1:-1]
-
     return s
 
 
@@ -116,6 +137,294 @@ def clean_url(url):
 
 
 # ─────────────────────────────────────────────
+# Extract title and date from context around URL
+# ─────────────────────────────────────────────
+def extract_metadata_from_context(body, url, match_start):
+    """
+    Given a URL found at position match_start in body,
+    search the surrounding HTML to find:
+    - Title: link text, nearby heading, title attribute
+    - Date: nearby date string
+
+    Returns: (title, date)
+    """
+    title = ""
+    date = ""
+
+    # Get a window of text around the match
+    window_start = max(0, match_start - 1000)
+    window_end = min(len(body), match_start + len(url) + 1000)
+    context = body[window_start:window_end]
+
+    escaped_url = re.escape(url)
+    # Also try partial match (last part of URL)
+    url_tail = url.split('/')[-1] if '/' in url else url
+    escaped_tail = re.escape(url_tail)
+
+    # ── TITLE EXTRACTION ──
+
+    # Method 1: <a href="URL">TITLE</a>
+    patterns_title = [
+        # Full URL in href
+        r'<a[^>]*href\s*=\s*["\'][^"\']*'
+        + escaped_tail
+        + r'[^"\']*["\'][^>]*>\s*(.*?)\s*</a>',
+        # Any anchor with this URL, get text
+        r'href\s*=\s*["\'][^"\']*'
+        + escaped_tail
+        + r'[^"\']*["\'][^>]*>\s*([^<]+)',
+    ]
+
+    for pattern in patterns_title:
+        try:
+            match = re.search(pattern, context, re.IGNORECASE | re.DOTALL)
+            if match:
+                raw_title = match.group(1).strip()
+                # Clean HTML from title
+                raw_title = re.sub(r'<[^>]+>', ' ', raw_title)
+                raw_title = re.sub(r'\s+', ' ', raw_title).strip()
+                if raw_title and len(raw_title) > 2:
+                    title = raw_title
+                    break
+        except re.error:
+            pass
+
+    # Method 2: title="..." attribute on the link
+    if not title:
+        try:
+            pattern = (
+                r'<a[^>]*href\s*=\s*["\'][^"\']*'
+                + escaped_tail
+                + r'[^"\']*["\'][^>]*title\s*=\s*["\']([^"\']+)["\']'
+            )
+            match = re.search(pattern, context, re.IGNORECASE)
+            if match:
+                title = match.group(1).strip()
+        except re.error:
+            pass
+
+    # Method 3: Nearby heading or strong text
+    if not title:
+        try:
+            # Look for headings near the URL
+            pattern = (
+                r'<(?:h[1-6]|strong|b)[^>]*>\s*([^<]+?)\s*'
+                r'</(?:h[1-6]|strong|b)>'
+            )
+            matches = re.findall(pattern, context, re.IGNORECASE)
+            for m in matches:
+                m = m.strip()
+                if m and len(m) > 3 and len(m) < 200:
+                    title = m
+                    break
+        except re.error:
+            pass
+
+    # Method 4: Nearby div/span with title-like class
+    if not title:
+        try:
+            pattern = (
+                r'<(?:div|span)[^>]*class\s*=\s*["\'][^"\']*'
+                r'(?:title|name|heading|label)[^"\']*["\'][^>]*>'
+                r'\s*([^<]+?)\s*</(?:div|span)>'
+            )
+            matches = re.findall(pattern, context, re.IGNORECASE)
+            for m in matches:
+                m = m.strip()
+                if m and len(m) > 3 and len(m) < 200:
+                    title = m
+                    break
+        except re.error:
+            pass
+
+    # Method 5: Use BeautifulSoup on context
+    if not title:
+        try:
+            soup = BeautifulSoup(context, 'html.parser')
+
+            # Find the <a> tag with our URL
+            for a_tag in soup.find_all('a', href=True):
+                href = a_tag.get('href', '')
+                if url_tail in href or url in href:
+                    # Get link text
+                    link_text = a_tag.get_text(strip=True)
+                    if link_text and len(link_text) > 2:
+                        title = link_text
+                        break
+
+                    # Check title attribute
+                    t = a_tag.get('title', '').strip()
+                    if t:
+                        title = t
+                        break
+
+            # If still no title, check parent elements
+            if not title:
+                for a_tag in soup.find_all('a', href=True):
+                    href = a_tag.get('href', '')
+                    if url_tail in href or url in href:
+                        parent = a_tag.parent
+                        while parent and parent.name:
+                            # Check siblings for title text
+                            for sibling in parent.children:
+                                if sibling == a_tag:
+                                    continue
+                                if hasattr(sibling, 'get_text'):
+                                    sib_text = sibling.get_text(strip=True)
+                                    if (sib_text
+                                            and len(sib_text) > 3
+                                            and len(sib_text) < 200
+                                            and not sib_text.startswith('http')):
+                                        title = sib_text
+                                        break
+                            if title:
+                                break
+                            parent = parent.parent
+                            # Don't go too far up
+                            if parent and parent.name in [
+                                'body', 'html', 'main', 'section'
+                            ]:
+                                break
+        except Exception:
+            pass
+
+    # ── DATE EXTRACTION ──
+
+    # Method 1: Date from nearby HTML
+    date_matches = DATE_REGEX.findall(context)
+    if date_matches:
+        # Pick the closest date to the URL position
+        # (dates found in the context window)
+        date = date_matches[0].strip()
+
+    # Method 2: Date from specific HTML elements
+    if not date:
+        try:
+            date_patterns_html = [
+                r'<(?:time|span|div)[^>]*(?:class|datetime)\s*=\s*["\'][^"\']*'
+                r'(?:date|time|published|posted)[^"\']*["\'][^>]*>\s*([^<]+)',
+                r'<time[^>]*datetime\s*=\s*["\']([^"\']+)["\']',
+                r'<(?:span|div)[^>]*class\s*=\s*["\'][^"\']*date[^"\']*["\'][^>]*>\s*([^<]+)',
+            ]
+            for pattern in date_patterns_html:
+                match = re.search(pattern, context, re.IGNORECASE)
+                if match:
+                    d = match.group(1).strip()
+                    if d and len(d) < 50:
+                        date = d
+                        break
+        except re.error:
+            pass
+
+    # Method 3: Date from BeautifulSoup
+    if not date:
+        try:
+            soup = BeautifulSoup(context, 'html.parser')
+
+            # <time> tags
+            for time_tag in soup.find_all('time'):
+                dt = time_tag.get('datetime', '')
+                if dt:
+                    date = dt.strip()
+                    break
+                t = time_tag.get_text(strip=True)
+                if t:
+                    date = t
+                    break
+
+            # Elements with date-related classes
+            if not date:
+                for tag in soup.find_all(
+                    class_=re.compile(
+                        r'date|time|publish|posted|created',
+                        re.IGNORECASE
+                    )
+                ):
+                    t = tag.get_text(strip=True)
+                    if t and len(t) < 50:
+                        # Verify it looks like a date
+                        if DATE_REGEX.search(t):
+                            date = t
+                            break
+        except Exception:
+            pass
+
+    # Method 4: Date from JSON context
+    if not date:
+        json_date_patterns = [
+            r'"(?:date|published|created|updated|timestamp|'
+            r'publishDate|createdAt|updatedAt|postDate|'
+            r'release_date|publish_date|filing_date)"\s*:\s*'
+            r'"([^"]+)"',
+        ]
+        for pattern in json_date_patterns:
+            try:
+                match = re.search(pattern, context, re.IGNORECASE)
+                if match:
+                    date = match.group(1).strip()
+                    break
+            except re.error:
+                pass
+
+    # Method 5: Date from URL itself
+    if not date:
+        # URLs like /2025/01/ or /2025-01/
+        url_date = re.search(
+            r'/(\d{4})[/-](\d{2})(?:[/-](\d{2}))?/',
+            url
+        )
+        if url_date:
+            y, m = url_date.group(1), url_date.group(2)
+            d_part = url_date.group(3)
+            if d_part:
+                date = f"{y}-{m}-{d_part}"
+            else:
+                date = f"{y}-{m}"
+
+    # Method 6: Date from filename
+    if not date:
+        fname = url.split('/')[-1]
+        # Patterns like Report-March2024.pdf
+        fname_date = re.search(
+            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
+            r'[a-z]*[-_]?\d{4}',
+            fname, re.IGNORECASE
+        )
+        if fname_date:
+            date = fname_date.group(0)
+
+        if not date:
+            # Patterns like 20240315 or 2024-03-15 in filename
+            fname_date2 = re.search(
+                r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})',
+                fname
+            )
+            if fname_date2:
+                y = fname_date2.group(1)
+                m = fname_date2.group(2)
+                d_val = fname_date2.group(3)
+                if 2000 <= int(y) <= 2030:
+                    date = f"{y}-{m}-{d_val}"
+
+    # Clean up title
+    if title:
+        title = re.sub(r'<[^>]+>', '', title)
+        title = re.sub(r'\s+', ' ', title).strip()
+        title = title.strip('|/-:. ')
+        if len(title) > 150:
+            title = title[:147] + "..."
+
+    # Clean up date
+    if date:
+        date = date.strip('|/-:,. ')
+        # Remove time portion if present
+        date = re.sub(r'T\d{2}:\d{2}.*$', '', date)
+        date = date.strip()
+
+    return title, date
+
+
+# ─────────────────────────────────────────────
 # Extract URLs from HTML
 # ─────────────────────────────────────────────
 def extract_urls_from_html(html_string, base_url=""):
@@ -131,8 +440,7 @@ def extract_urls_from_html(html_string, base_url=""):
     url_attrs = [
         'href', 'src', 'data-href', 'data-src',
         'data-url', 'data-file', 'data-download',
-        'data-pdf', 'data-link', 'data-path',
-        'action', 'content', 'value',
+        'data-pdf', 'data-link', 'action', 'content',
     ]
 
     for attr in url_attrs:
@@ -167,7 +475,7 @@ def extract_urls_from_html(html_string, base_url=""):
 
 
 # ─────────────────────────────────────────────
-# Parse HAR → collect unescaped bodies
+# Parse HAR bodies
 # ─────────────────────────────────────────────
 def parse_har_bodies(har_content):
     bodies = []
@@ -197,24 +505,19 @@ def parse_har_bodies(har_content):
             continue
 
         mime = content.get('mimeType', '').lower()
-
-        # Unescape body
         unescaped = unescape_json_string(body)
         bodies.append((mime, req_url, unescaped))
 
-        # For JSON bodies, extract HTML fragments from values
         if ('json' in mime
                 or unescaped.strip().startswith(('{', '['))):
             try:
                 data = json.loads(unescaped)
-                html_frags = extract_html_from_json(data)
-                for frag in html_frags:
+                for frag in extract_html_from_json(data):
                     clean_frag = unescape_json_string(frag)
                     if '<' in clean_frag and '>' in clean_frag:
                         bodies.append((
                             'text/html (from json)',
-                            req_url,
-                            clean_frag
+                            req_url, clean_frag
                         ))
             except json.JSONDecodeError:
                 pass
@@ -246,7 +549,6 @@ def extract_html_from_json(data):
         indicators = [
             '<a ', '<a\n', '<div', '<span', '<td',
             '<tr', '<table', '<p ', '<p>', '<li',
-            '<ul', '<article', '<section',
             'href=', 'src=',
         ]
         vl = value.lower()
@@ -258,33 +560,20 @@ def extract_html_from_json(data):
 
 
 # ─────────────────────────────────────────────
-# SMART REGEX: Find URLs AROUND a match
+# Find URLs around a non-URL regex match
 # ─────────────────────────────────────────────
 def find_urls_around_match(body, match_text, match_start):
-    """
-    When a regex matches something that is NOT a URL
-    (like 'communique-de-presse'), search the surrounding
-    context to find the actual URL containing that text.
-    
-    Strategy:
-    1. Look backwards and forwards from match position
-    2. Find the enclosing href="..." or src="..."
-    3. Or find the full URL that contains the match text
-    """
     urls = set()
-
-    # Search window: 500 chars before and after
     window_start = max(0, match_start - 500)
     window_end = min(len(body), match_start + len(match_text) + 500)
     context = body[window_start:window_end]
 
-    # Strategy 1: Find href/src containing the match
+    escaped = re.escape(match_text)
+
     href_patterns = [
-        r'href\s*=\s*["\']([^"\']*' + re.escape(match_text) + r'[^"\']*)["\']',
-        r'src\s*=\s*["\']([^"\']*' + re.escape(match_text) + r'[^"\']*)["\']',
-        r'data-url\s*=\s*["\']([^"\']*' + re.escape(match_text) + r'[^"\']*)["\']',
-        r'data-href\s*=\s*["\']([^"\']*' + re.escape(match_text) + r'[^"\']*)["\']',
-        r'action\s*=\s*["\']([^"\']*' + re.escape(match_text) + r'[^"\']*)["\']',
+        r'href\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
+        r'src\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
+        r'data-url\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
     ]
 
     for pattern in href_patterns:
@@ -294,10 +583,9 @@ def find_urls_around_match(body, match_text, match_start):
         except re.error:
             pass
 
-    # Strategy 2: Find full URL containing the match text
     url_pattern = (
         r'(https?://[^\s"\'<>]*'
-        + re.escape(match_text)
+        + escaped
         + r'[^\s"\'<>]*)'
     )
     try:
@@ -306,36 +594,15 @@ def find_urls_around_match(body, match_text, match_start):
     except re.error:
         pass
 
-    # Strategy 3: Find JSON value containing the match
-    json_patterns = [
-        r'"(?:url|href|link|path|file|src)"\s*:\s*"([^"]*'
-        + re.escape(match_text) + r'[^"]*)"',
-    ]
-    for pattern in json_patterns:
-        try:
-            found = re.findall(pattern, context, re.IGNORECASE)
-            urls.update(found)
-        except re.error:
-            pass
-
     return urls
 
 
 # ─────────────────────────────────────────────
-# SMART REGEX APPLICATION
+# Smart regex application with metadata
 # ─────────────────────────────────────────────
 def apply_smart_regex(bodies, pattern, exclude_keywords):
     """
-    Apply regex on response bodies with SMART URL extraction.
-    
-    If regex returns a full URL → use it directly.
-    If regex returns a non-URL text → search around
-    the match to find the enclosing URL.
-    
-    This means BOTH of these work:
-    
-    1. href="([^"]*communique[^"]*)"   → returns URL directly
-    2. communique-de-presse             → finds URL around match
+    Returns: list of (url, matched_by, source_url, title, date)
     """
     results = []
     seen = set()
@@ -343,12 +610,10 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
     try:
         compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
-        st.error(f"Invalid regex pattern: `{pattern}`\nError: {e}")
+        st.error(f"Invalid regex: `{pattern}`\nError: {e}")
         return results
 
     exc_lower = [e.strip().lower() for e in exclude_keywords if e.strip()]
-
-    # Auto excludes
     auto_exc = [
         '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
         '.ico', '.css', '.woff', '.woff2', '.ttf',
@@ -362,18 +627,13 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
         if not body:
             continue
 
-        # Get base URL from request
         try:
             p = urlparse(req_url)
             base_url = f"{p.scheme}://{p.netloc}"
         except Exception:
             base_url = ""
 
-        # Find all matches with positions
         for match_obj in compiled.finditer(body):
-
-            # Get the matched text
-            # If there are groups, use group(1), else group(0)
             if match_obj.lastindex and match_obj.lastindex >= 1:
                 matched_text = match_obj.group(1)
             else:
@@ -384,38 +644,42 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
 
             match_start = match_obj.start()
 
-            # ── Check if match IS already a URL ──
             cleaned = clean_url(matched_text)
 
             if cleaned:
-                # It's a valid URL
                 if cleaned not in seen:
                     if not any(e in cleaned.lower() for e in all_exc):
                         seen.add(cleaned)
+                        title, date = extract_metadata_from_context(
+                            body, cleaned, match_start
+                        )
                         results.append((
-                            cleaned, f"regex-direct", req_url
+                            cleaned, "regex-direct",
+                            req_url, title, date
                         ))
                 continue
 
-            # ── Match is NOT a URL — find URL around it ──
-            surrounding_urls = find_urls_around_match(
+            surrounding = find_urls_around_match(
                 body, matched_text, match_start
             )
 
-            for raw_url in surrounding_urls:
-                cleaned = clean_url(raw_url)
-                if not cleaned:
-                    # Try as relative URL
+            for raw_url in surrounding:
+                c = clean_url(raw_url)
+                if not c:
                     if raw_url.startswith('/') and base_url:
-                        cleaned = base_url + raw_url
+                        c = base_url + raw_url
                     else:
                         continue
 
-                if cleaned not in seen:
-                    if not any(e in cleaned.lower() for e in all_exc):
-                        seen.add(cleaned)
+                if c not in seen:
+                    if not any(e in c.lower() for e in all_exc):
+                        seen.add(c)
+                        title, date = extract_metadata_from_context(
+                            body, c, match_start
+                        )
                         results.append((
-                            cleaned, f"regex-context", req_url
+                            c, "regex-context",
+                            req_url, title, date
                         ))
 
     results.sort(key=lambda x: x[0].split('/')[-1].lower())
@@ -423,15 +687,17 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
 
 
 # ─────────────────────────────────────────────
-# Keyword filter on bodies
+# Keyword filter with metadata
 # ─────────────────────────────────────────────
 def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
+    """
+    Returns: list of (url, matched_by, source_url, title, date)
+    """
     results = []
     seen = set()
 
     inc = [kw.strip().lower() for kw in include_keywords if kw.strip()]
     exc = [kw.strip().lower() for kw in exclude_keywords if kw.strip()]
-
     auto_exc = [
         '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
         '.ico', '.css', '.woff', '.woff2', '.ttf',
@@ -453,15 +719,12 @@ def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
 
         found_urls = set()
 
-        # Parse HTML
         if '<' in body and '>' in body:
             found_urls.update(extract_urls_from_html(body, base))
 
-        # Raw URL regex
         raw = re.findall(r'https?://[^\s"\'<>\\,;\]})]+', body)
         found_urls.update(raw)
 
-        # Filter
         for raw_url in found_urls:
             cleaned = clean_url(raw_url)
             if not cleaned or cleaned in seen:
@@ -479,20 +742,65 @@ def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
 
             if matched:
                 seen.add(cleaned)
-                results.append((cleaned, f"keyword: {matched}", req_url))
+                # Find position in body for context
+                pos = body.find(raw_url)
+                if pos == -1:
+                    pos = body.find(cleaned)
+                if pos == -1:
+                    pos = 0
+
+                title, date = extract_metadata_from_context(
+                    body, cleaned, pos
+                )
+                results.append((
+                    cleaned, f"keyword: {matched}",
+                    req_url, title, date
+                ))
 
     results.sort(key=lambda x: x[0].split('/')[-1].lower())
     return results
 
 
 # ─────────────────────────────────────────────
-# Generate TXT
+# Generate output files
 # ─────────────────────────────────────────────
-# ─────────────────────────────────────────────
-# Generate TXT with <a href="..."> format
-# ─────────────────────────────────────────────
-def generate_txt(results, source, inc_kw, exc_kw,
-                 pdf_regex="", html_regex=""):
+def generate_html_links(results):
+    """
+    Generate <a href="URL">Title | Date</a> format.
+    One per line.
+    """
+    lines = []
+    for item in results:
+        url = item[0]
+        title = item[3] if len(item) > 3 else ""
+        date = item[4] if len(item) > 4 else ""
+
+        # Build display text
+        fname = url.split('/')[-1].split('?')[0]
+        if not fname:
+            fname = url.split('/')[-2] if '/' in url else "link"
+
+        display_parts = []
+        if title:
+            display_parts.append(title)
+        else:
+            # Use filename as fallback title
+            clean_fname = fname.replace('.pdf', '').replace('.xlsx', '')
+            clean_fname = clean_fname.replace('-', ' ').replace('_', ' ')
+            display_parts.append(clean_fname.strip() or fname)
+
+        if date:
+            display_parts.append(date)
+
+        display_text = " | ".join(display_parts)
+
+        lines.append(f'<a href="{url}">{display_text}</a>')
+
+    return "\n".join(lines)
+
+
+def generate_full_report(results, source, inc_kw, exc_kw,
+                         pdf_regex="", html_regex=""):
     lines = [
         "=" * 70,
         "URL EXTRACTION REPORT",
@@ -509,61 +817,45 @@ def generate_txt(results, source, inc_kw, exc_kw,
         lines.append(f"HTML Regex   : {html_regex}")
     lines.append(f"Excludes     : {len(exc_kw)} patterns")
 
-    lines.extend(["=" * 70, "", "── EXTRACTED URLS ──", ""])
+    lines.extend(["=" * 70, ""])
+    lines.append("── HTML LINKS WITH TITLES & DATES ──")
+    lines.append("")
 
-    for i, (url, matched_by, src) in enumerate(results, 1):
+    for i, item in enumerate(results, 1):
+        url = item[0]
+        matched_by = item[1]
+        title = item[3] if len(item) > 3 else ""
+        date = item[4] if len(item) > 4 else ""
+
         fname = url.split('/')[-1].split('?')[0]
         if not fname:
-            fname = url.split('/')[-2] if '/' in url else "link"
-        lines.append(f'{i:4d}. <a href="{url}">{fname}</a>')
-        lines.append(f"      [matched: {matched_by}]")
+            fname = "link"
+
+        display_parts = []
+        if title:
+            display_parts.append(title)
+        else:
+            display_parts.append(fname)
+        if date:
+            display_parts.append(date)
+
+        display = " | ".join(display_parts)
+
+        lines.append(f'{i:4d}. <a href="{url}">{display}</a>')
+        lines.append(f"      Title: {title or '(from filename)'}")
+        lines.append(f"      Date:  {date or '(not found)'}")
+        lines.append(f"      Match: {matched_by}")
         lines.append("")
 
-    lines.extend([
-        "=" * 70, "",
-        "── HTML LINKS (copy-paste into any HTML page) ──", ""
-    ])
-    for url, _, _ in results:
-        fname = url.split('/')[-1].split('?')[0]
-        if not fname:
-            fname = url.split('/')[-2] if '/' in url else "link"
-        lines.append(f'<a href="{url}">{fname}</a>')
-
-    lines.extend([
-        "", "=" * 70, "",
-        "── PLAIN URL LIST ──", ""
-    ])
-    for url, _, _ in results:
-        lines.append(url)
+    lines.extend(["=" * 70, ""])
+    lines.append("── PLAIN URL LIST ──")
+    lines.append("")
+    for item in results:
+        lines.append(item[0])
 
     lines.extend(["", "=" * 70, "END"])
     return "\n".join(lines)
 
-
-# ─────────────────────────────────────────────
-# Generate HTML-only output (just <a href> tags)
-# ─────────────────────────────────────────────
-def generate_html_links(results):
-    """
-    Generate clean file with ONLY <a href="..."> tags.
-    One per line. Ready to paste into HTML.
-    """
-    lines = []
-    for url, _, _ in results:
-        fname = url.split('/')[-1].split('?')[0]
-        if not fname:
-            fname = url.split('/')[-2] if '/' in url else "link"
-        # Clean filename for display text
-        # Remove extension for cleaner display
-        display = fname.replace('.pdf', '').replace('.xlsx', '')
-        display = display.replace('-', ' ').replace('_', ' ')
-        display = display.strip()
-        if not display:
-            display = fname
-
-        lines.append(f'<a href="{url}">{fname}</a>')
-
-    return "\n".join(lines)
 
 # ═════════════════════════════════════════════
 # UI
@@ -571,8 +863,8 @@ def generate_html_links(results):
 
 st.title("📄 HAR → URL Extractor")
 st.markdown(
-    "Upload `.har` file → Extract PDF, HTML, or any URLs "
-    "using **keywords + smart regex**"
+    "Upload `.har` → Extract URLs with **titles & dates** "
+    "→ Download as `<a href>` format"
 )
 
 with st.expander("📖 How to capture .har file"):
@@ -580,29 +872,22 @@ with st.expander("📖 How to capture .har file"):
     1. Chrome → target website → F12 → Network tab
     2. Check **"Preserve log"**
     3. **Click ALL tabs/buttons** on the page
-    4. Right-click in Network list → **Save all as HAR with content**
+    4. Right-click in Network → **Save all as HAR with content**
     5. Upload here
     """)
 
 st.markdown("---")
-
-# Upload
 uploaded_file = st.file_uploader("📁 Upload .har file", type=['har'])
 
-# ─── Filter Settings ───
+# ─── Settings ───
 st.markdown("---")
 st.subheader("🔧 Extraction Settings")
-st.markdown(
-    "Use **Keywords** for simple matching, "
-    "**Regex** for advanced patterns. "
-    "Results from ALL methods are combined."
-)
 
 kw1, kw2 = st.columns(2)
 with kw1:
     st.markdown("**✅ Include Keywords** (URL must contain ≥1)")
     include_input = st.text_input(
-        "Keywords (separate with |)",
+        "Keywords (| separated)",
         value=".pdf",
         placeholder=".pdf|/download/|.xlsx",
         key="inc"
@@ -610,61 +895,31 @@ with kw1:
 with kw2:
     st.markdown("**❌ Exclude Keywords**")
     exclude_input = st.text_input(
-        "Exclude (separate with |)",
-        value=(
-            ".jpg|.jpeg|.png|.gif|.svg|.webp|.ico|"
-            ".css|.woff|.woff2"
-        ),
+        "Exclude (| separated)",
+        value=".jpg|.jpeg|.png|.gif|.svg|.webp|.ico|.css|.woff|.woff2",
         key="exc"
     )
 
 st.markdown("---")
 st.subheader("🔍 Regex Patterns (Smart)")
-st.markdown("""
-**How smart regex works:**
-- If your regex **captures a full URL** → used directly  
-- If your regex **matches text that's NOT a URL** (like `communique-de-presse`) 
-  → the app automatically searches the surrounding HTML/JSON to find 
-  the **full URL containing that text**
-
-**So both of these work:**
-- `communique-de-presse` — finds URLs containing this text
-- `href="([^"]*communique[^"]*)"` — extracts URL from href directly
-""")
+st.caption(
+    "Type a simple keyword OR a full regex. "
+    "The app finds the URL automatically."
+)
 
 rx1, rx2 = st.columns(2)
 with rx1:
     st.markdown("**📄 PDF / Document Regex**")
     pdf_regex = st.text_input(
-        "PDF regex",
-        value="",
-        placeholder=r'\.pdf',
-        help=(
-            "Simple examples:\n"
-            "  `.pdf` — any body text containing .pdf\n"
-            "  `annual-report` — finds URLs with this text\n\n"
-            "Advanced examples:\n"
-            "  `https?://[^\\s\"<>]+\\.pdf` — full PDF URLs\n"
-            "  `href=\"([^\"]+\\.pdf[^\"]*)\"` — PDF in href"
-        ),
+        "PDF regex", value="",
+        placeholder=r'\.pdf|annual-report',
         key="pdf_rx"
     )
 with rx2:
     st.markdown("**🌐 HTML / Page Link Regex**")
     html_regex = st.text_input(
-        "HTML regex",
-        value="",
+        "HTML regex", value="",
         placeholder="communique-de-presse",
-        help=(
-            "Simple examples:\n"
-            "  `communique-de-presse` — URLs with this path\n"
-            "  `investor` — any URL containing 'investor'\n"
-            "  `/en/press/` — specific path pattern\n\n"
-            "Advanced examples:\n"
-            "  `href=\"([^\"]*communique[^\"]*)\"` — from href\n"
-            "  `<a[^>]+href=\"([^\"]+)\"` — all anchor hrefs\n"
-            "  `<td[^>]*>\\s*(https?://[^<]+)</td>` — URLs in td"
-        ),
         key="html_rx"
     )
 
@@ -675,7 +930,6 @@ exclude_keywords = [
     kw.strip() for kw in exclude_input.split('|') if kw.strip()
 ]
 
-# Summary
 parts = []
 if include_keywords:
     parts.append(f"Keywords: `{'`, `'.join(include_keywords)}`")
@@ -685,7 +939,7 @@ if html_regex.strip():
     parts.append(f"HTML regex: `{html_regex.strip()}`")
 st.info(
     f"**Active:** {' | '.join(parts)}" if parts else
-    "**⚠️ No filters set — add keywords or regex above**"
+    "**⚠️ No filters set**"
 )
 
 # ─── Extract ───
@@ -704,7 +958,7 @@ if uploaded_file:
 
     if st.button("🚀 Extract URLs", type="primary", key="go"):
 
-        with st.spinner("Parsing HAR & unescaping bodies..."):
+        with st.spinner("Parsing HAR file..."):
             bodies, parse_log = parse_har_bodies(har_content)
             st.session_state.body_texts = bodies
             st.session_state.extraction_log = parse_log
@@ -712,42 +966,38 @@ if uploaded_file:
         all_results = []
         seen = set()
 
-        # Method 1: Keywords
         if include_keywords:
-            with st.spinner(
-                f"Keyword search: {include_keywords}..."
-            ):
-                kw_res = apply_keyword_filter(
+            with st.spinner(f"Keywords: {include_keywords}..."):
+                for item in apply_keyword_filter(
                     bodies, include_keywords, exclude_keywords
-                )
-                for url, mb, src in kw_res:
-                    if url not in seen:
-                        seen.add(url)
-                        all_results.append((url, mb, src))
+                ):
+                    if item[0] not in seen:
+                        seen.add(item[0])
+                        all_results.append(item)
 
-        # Method 2: PDF regex
         if pdf_regex.strip():
-            with st.spinner(f"PDF regex: {pdf_regex.strip()}..."):
-                pdf_res = apply_smart_regex(
+            with st.spinner(f"PDF regex: {pdf_regex}..."):
+                for item in apply_smart_regex(
                     bodies, pdf_regex.strip(), exclude_keywords
-                )
-                for url, mb, src in pdf_res:
-                    if url not in seen:
-                        seen.add(url)
-                        all_results.append((url, f"pdf-{mb}", src))
+                ):
+                    if item[0] not in seen:
+                        seen.add(item[0])
+                        all_results.append((
+                            item[0], f"pdf-{item[1]}",
+                            item[2], item[3], item[4]
+                        ))
 
-        # Method 3: HTML regex
         if html_regex.strip():
-            with st.spinner(f"HTML regex: {html_regex.strip()}..."):
-                html_res = apply_smart_regex(
+            with st.spinner(f"HTML regex: {html_regex}..."):
+                for item in apply_smart_regex(
                     bodies, html_regex.strip(), exclude_keywords
-                )
-                for url, mb, src in html_res:
-                    if url not in seen:
-                        seen.add(url)
-                        all_results.append(
-                            (url, f"html-{mb}", src)
-                        )
+                ):
+                    if item[0] not in seen:
+                        seen.add(item[0])
+                        all_results.append((
+                            item[0], f"html-{item[1]}",
+                            item[2], item[3], item[4]
+                        ))
 
         all_results.sort(
             key=lambda x: x[0].split('/')[-1].lower()
@@ -755,19 +1005,19 @@ if uploaded_file:
         st.session_state.filtered_links = all_results
         st.session_state.har_loaded = True
 
-        # Metrics
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            c = len([r for r in all_results if 'keyword' in r[1]])
-            st.metric("🔑 Keyword", c)
+            st.metric("🔑 Keyword",
+                       len([r for r in all_results if 'keyword' in r[1]]))
         with m2:
-            c = len([r for r in all_results if 'pdf' in r[1]])
-            st.metric("📄 PDF Regex", c)
+            st.metric("📄 PDF Regex",
+                       len([r for r in all_results if 'pdf' in r[1]]))
         with m3:
-            c = len([r for r in all_results if 'html' in r[1]])
-            st.metric("🌐 HTML Regex", c)
+            st.metric("🌐 HTML Regex",
+                       len([r for r in all_results if 'html' in r[1]]))
         with m4:
             st.metric("📊 Total", len(all_results))
+
 
 # ─── Results ───
 if st.session_state.har_loaded and st.session_state.filtered_links:
@@ -781,28 +1031,32 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
         seen = set()
 
         if include_keywords:
-            for url, mb, src in apply_keyword_filter(
+            for item in apply_keyword_filter(
                 bodies, include_keywords, exclude_keywords
             ):
-                if url not in seen:
-                    seen.add(url)
-                    all_results.append((url, mb, src))
-
+                if item[0] not in seen:
+                    seen.add(item[0])
+                    all_results.append(item)
         if pdf_regex.strip():
-            for url, mb, src in apply_smart_regex(
+            for item in apply_smart_regex(
                 bodies, pdf_regex.strip(), exclude_keywords
             ):
-                if url not in seen:
-                    seen.add(url)
-                    all_results.append((url, f"pdf-{mb}", src))
-
+                if item[0] not in seen:
+                    seen.add(item[0])
+                    all_results.append((
+                        item[0], f"pdf-{item[1]}",
+                        item[2], item[3], item[4]
+                    ))
         if html_regex.strip():
-            for url, mb, src in apply_smart_regex(
+            for item in apply_smart_regex(
                 bodies, html_regex.strip(), exclude_keywords
             ):
-                if url not in seen:
-                    seen.add(url)
-                    all_results.append((url, f"html-{mb}", src))
+                if item[0] not in seen:
+                    seen.add(item[0])
+                    all_results.append((
+                        item[0], f"html-{item[1]}",
+                        item[2], item[3], item[4]
+                    ))
 
         all_results.sort(
             key=lambda x: x[0].split('/')[-1].lower()
@@ -811,52 +1065,55 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
         st.rerun()
 
     # Display
-    for i, (url, matched_by, source) in enumerate(
-        st.session_state.filtered_links, 1
-    ):
+    for i, item in enumerate(st.session_state.filtered_links, 1):
+        url = item[0]
+        matched_by = item[1]
+        title = item[3] if len(item) > 3 and item[3] else ""
+        date = item[4] if len(item) > 4 and item[4] else ""
+
         fname = url.split('/')[-1].split('?')[0]
-        if len(fname) > 60:
-            fname = fname[:57] + "..."
         if not fname:
             fname = url[:50]
 
-        c1, c2, c3, c4 = st.columns([0.4, 2.8, 4.5, 2])
+        c1, c2, c3, c4, c5 = st.columns([0.3, 2.5, 1.2, 3.5, 1.5])
         with c1:
             st.text(f"{i}.")
         with c2:
-            st.text(f"📄 {fname}")
+            display = title if title else fname
+            if len(display) > 50:
+                display = display[:47] + "..."
+            st.text(f"📄 {display}")
         with c3:
-            st.markdown(f"[Open Link]({url})")
+            st.text(f"📅 {date}" if date else "📅 —")
         with c4:
+            st.markdown(f"[Open Link]({url})")
+        with c5:
             st.caption(matched_by)
 
-   # Downloads
+    # ─── Downloads ───
     st.markdown("---")
     st.header("⬇️ Download")
 
     d1, d2, d3, d4 = st.columns(4)
 
-    # Option 1: HTML <a href> links only
     with d1:
-        html_links = generate_html_links(
+        html_out = generate_html_links(
             st.session_state.filtered_links
         )
         st.download_button(
             '📝 HTML Links (.txt)',
-            data=html_links,
+            data=html_out,
             file_name=(
-                f"html_links_"
-                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                f"links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             ),
             mime="text/plain",
             type="primary",
-            help='Each URL as <a href="...">filename</a>'
+            help='<a href="URL">Title | Date</a> format'
         )
 
-    # Option 2: Plain URLs
     with d2:
         plain = "\n".join(
-            u for u, _, _ in st.session_state.filtered_links
+            u for u, *_ in st.session_state.filtered_links
         )
         st.download_button(
             "🔗 Plain URLs (.txt)",
@@ -864,13 +1121,11 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             file_name=(
                 f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             ),
-            mime="text/plain",
-            help="Just URLs, one per line"
+            mime="text/plain"
         )
 
-    # Option 3: Full report
     with d3:
-        report = generate_txt(
+        report = generate_full_report(
             st.session_state.filtered_links,
             uploaded_file.name if uploaded_file else "unknown",
             include_keywords, exclude_keywords,
@@ -882,60 +1137,67 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             file_name=(
                 f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
             ),
-            mime="text/plain",
-            help="Detailed report with all sections"
+            mime="text/plain"
         )
 
-    # Option 4: CSV
     with d4:
-        csv_lines = ["index,filename,url,matched_by"]
-        for i, (u, m, _) in enumerate(
+        csv_lines = ["index,title,date,url,matched_by"]
+        for i, item in enumerate(
             st.session_state.filtered_links, 1
         ):
-            fn = u.split('/')[-1].split('?')[0].replace(',', '_')
-            csv_lines.append(f'{i},"{fn}","{u}","{m}"')
+            url = item[0]
+            title = (item[3] if len(item) > 3 and item[3]
+                     else "").replace('"', "'")
+            date = (item[4] if len(item) > 4 and item[4]
+                    else "").replace('"', "'")
+            mb = item[1].replace('"', "'")
+            csv_lines.append(
+                f'{i},"{title}","{date}","{url}","{mb}"'
+            )
         st.download_button(
             "📊 CSV (.csv)",
             data="\n".join(csv_lines),
             file_name=(
-                f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                f"data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
             ),
             mime="text/csv"
         )
 
-    # Copy-paste section with <a href> format
+    # Copy section
     st.markdown("---")
-    st.subheader("📋 Copy-Paste (HTML format)")
-    html_links = generate_html_links(
-        st.session_state.filtered_links
-    )
-    st.text_area(
-        'All URLs as <a href="..."> tags',
-        value=html_links,
-        height=250,
-        key="copy_html"
-    )
+    st.subheader("📋 Copy-Paste")
 
-    # Also show plain URLs
-    with st.expander("📋 Plain URLs (copy-paste)"):
+    tab_html, tab_plain = st.tabs([
+        "HTML Links", "Plain URLs"
+    ])
+
+    with tab_html:
+        html_out = generate_html_links(
+            st.session_state.filtered_links
+        )
+        st.text_area(
+            '<a href="URL">Title | Date</a> format',
+            value=html_out,
+            height=250,
+            key="copy_html"
+        )
+
+    with tab_plain:
         plain = "\n".join(
-            u for u, _, _ in st.session_state.filtered_links
+            u for u, *_ in st.session_state.filtered_links
         )
         st.text_area(
             "Plain URLs",
             value=plain,
-            height=200,
+            height=250,
             key="copy_plain"
         )
+
 
 # ─── Debug ───
 if st.session_state.har_loaded:
     st.markdown("---")
     st.subheader("🔧 Debug: Search Response Bodies")
-    st.caption(
-        "Search inside response content to find "
-        "the right keyword or regex pattern."
-    )
 
     if st.session_state.body_texts:
         body_search = st.text_input(
@@ -943,7 +1205,6 @@ if st.session_state.har_loaded:
             placeholder="communique, .pdf, investor...",
             key="bsearch"
         )
-
         if body_search:
             count = 0
             for mime, req_url, body in st.session_state.body_texts:
@@ -957,11 +1218,8 @@ if st.session_state.har_loaded:
                         )
                         start = max(0, idx - 300)
                         end = min(len(body), idx + 500)
-                        snippet = body[start:end]
-                        st.code(snippet, language="html")
-
+                        st.code(body[start:end], language="html")
                     if count >= 15:
-                        st.caption("Showing first 15...")
                         break
 
             if count:
@@ -978,40 +1236,29 @@ if st.session_state.har_loaded:
 with st.sidebar:
     st.header("📖 Quick Reference")
 
-    st.markdown("### Simple (just type text)")
-    st.code("communique-de-presse", language="text")
-    st.caption("→ Finds all URLs containing this text")
-
+    st.markdown("### Keywords")
     st.code(".pdf", language="text")
-    st.caption("→ Finds all PDF URLs")
+    st.code("communique-de-presse", language="text")
+    st.code(".pdf|.xlsx|annual-report", language="text")
 
-    st.code("annual-report", language="text")
-    st.caption("→ Finds URLs with 'annual-report'")
-
-    st.markdown("### Advanced Regex")
+    st.markdown("### Regex")
     st.code(r'href="([^"]*investor[^"]*)"', language="text")
-    st.caption("→ href values containing 'investor'")
-
-    st.code(r'https?://[^\s"]+\.pdf', language="text")
-    st.caption("→ Full PDF URLs from any text")
-
-    st.code(r'<td[^>]*>\s*(https?://[^<]+)</td>', language="text")
-    st.caption("→ URLs inside td tags")
+    st.code(r'communique-de-presse', language="text")
+    st.code(r'<td[^>]*>(https?://[^<]+)</td>', language="text")
 
     st.markdown("---")
     st.markdown("""
-    ### How Smart Regex Works
-    
+    ### Output Format
     ```
-    You type: communique-de-presse
-    
-    App finds this in body text.
-    
-    Then searches AROUND the match:
-    → Found href="https://...communique-de-presse/..."
-    → Extracts the full URL
-    → Returns clean working link
+    <a href="URL">Title | Date</a>
     ```
+    
+    ### Dates Extracted From
+    - Nearby HTML elements
+    - `<time>` tags
+    - JSON date fields
+    - URL path (/2025/01/)
+    - Filename (Report-March2024)
     """)
 
     st.markdown("---")
