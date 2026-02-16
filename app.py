@@ -18,29 +18,84 @@ st.set_page_config(
 # Session State
 # ─────────────────────────────────────────────
 defaults = {
-    'raw_urls': [],            # all URLs from standard extraction
-    'deep_urls': [],           # URLs from deep HTML/JSON parsing
-    'body_texts': [],          # raw response bodies for regex
     'filtered_links': [],
+    'regex_matches': [],       # only regex-matched items
+    'keyword_matches': [],     # only keyword-matched items
+    'body_texts': [],
     'har_loaded': False,
-    'har_content_cache': None,
+    'extraction_log': [],      # what happened during extraction
 }
 for key, val in defaults.items():
     if key not in st.session_state:
-        st.session_state[key] = val if not isinstance(val, list) else []
+        st.session_state[key] = []
 
 
 # ─────────────────────────────────────────────
-# Clean URL
+# Unescape JSON string content
+# ─────────────────────────────────────────────
+def unescape_json_string(text):
+    """
+    Unescape a string that was inside a JSON value.
+    
+    HAR files store response bodies as JSON strings,
+    so HTML inside JSON gets double-escaped:
+    
+    Original HTML:
+      <a href="https://example.com/file.pdf">
+    
+    Inside JSON:
+      "text": "<a href=\\\"https:\\/\\/example.com\\/file.pdf\\\">"
+    
+    This function reverses ALL that escaping.
+    """
+    if not text or not isinstance(text, str):
+        return ""
+
+    s = text
+
+    # Step 1: Handle JSON unicode escapes
+    s = s.replace('\\u003c', '<')
+    s = s.replace('\\u003e', '>')
+    s = s.replace('\\u0026', '&')
+    s = s.replace('\\u003d', '=')
+    s = s.replace('\\u0022', '"')
+    s = s.replace('\\u0027', "'")
+
+    # Step 2: Unescape JSON string escapes (multiple passes)
+    for _ in range(5):
+        old = s
+        s = s.replace('\\"', '"')
+        s = s.replace('\\/', '/')
+        s = s.replace('\\\\', '\\')
+        s = s.replace('\\n', '\n')
+        s = s.replace('\\r', '\r')
+        s = s.replace('\\t', '\t')
+        if s == old:
+            break
+
+    # Step 3: Fix any remaining escaped slashes
+    s = re.sub(r'\\+/', '/', s)
+
+    # Step 4: Remove leading/trailing quotes that
+    # sometimes wrap the entire body
+    s = s.strip()
+    if s.startswith('"') and s.endswith('"'):
+        s = s[1:-1]
+
+    return s
+
+
+# ─────────────────────────────────────────────
+# Clean a single URL
 # ─────────────────────────────────────────────
 def clean_url(url):
-    """Fix broken/escaped URLs from HAR files"""
+    """Fix broken/escaped URLs"""
     if not url or not isinstance(url, str):
         return ""
 
     cleaned = url.strip().strip('"\'')
 
-    # Multiple passes to fix nested escaping
+    # Unescape
     for _ in range(5):
         old = cleaned
         cleaned = cleaned.replace('\\/', '/')
@@ -50,13 +105,9 @@ def clean_url(url):
         cleaned = cleaned.replace('\\r', '')
         cleaned = cleaned.replace('\\t', '')
         cleaned = cleaned.replace('\\u0026', '&')
-        cleaned = cleaned.replace('\\u003d', '=')
-        cleaned = cleaned.replace('\\u003c', '<')
-        cleaned = cleaned.replace('\\u003e', '>')
         if cleaned == old:
             break
 
-    # Fix remaining backslashes before slashes
     cleaned = re.sub(r'\\+/', '/', cleaned)
 
     # URL decode
@@ -72,20 +123,15 @@ def clean_url(url):
     elif not cleaned.startswith('http'):
         return ""
 
-    # Remove remaining backslashes
     cleaned = cleaned.replace('\\', '/')
-
-    # Fix triple slashes but keep ://
     cleaned = re.sub(r'(?<!:)/{2,}', '/', cleaned)
-
-    # Strip trailing junk
     cleaned = cleaned.rstrip('\\",;\')} \t\n\r>')
 
     # Remove fragment
     if '#' in cleaned:
         cleaned = cleaned.split('#')[0]
 
-    # Final validation
+    # Basic validation
     if not re.match(r'https?://.+\..+', cleaned):
         return ""
 
@@ -93,22 +139,17 @@ def clean_url(url):
 
 
 # ─────────────────────────────────────────────
-# Extract URLs from HTML string (any source)
+# Extract URLs from HTML string
 # ─────────────────────────────────────────────
 def extract_urls_from_html(html_string, base_url=""):
     """
-    Parse an HTML string and extract URLs from:
-    - <a href="...">
-    - <td>https://...</td>
-    - <span>https://...</span>
-    - Any tag with href, src, data-href, data-src,
-      data-url, data-file, data-download, action, 
-      content attributes
-    - onclick="window.open('...')"
-    - style="background: url(...)"
+    Parse HTML and extract URLs from ALL possible locations:
+    - <a href>, <img src>, <embed src>, etc.
+    - <td>, <span>, <div> text content
+    - onclick, data-* attributes
+    - style background-url
     """
     urls = set()
-
     if not html_string or len(html_string) < 10:
         return urls
 
@@ -117,21 +158,20 @@ def extract_urls_from_html(html_string, base_url=""):
     except Exception:
         return urls
 
-    # ── Attributes that can hold URLs ──
-    url_attributes = [
+    # Attributes that hold URLs
+    url_attrs = [
         'href', 'src', 'data-href', 'data-src',
         'data-url', 'data-file', 'data-download',
         'data-pdf', 'data-link', 'data-path',
-        'data-document', 'data-attachment',
-        'action', 'content', 'value',
-        'data-original', 'data-source',
+        'data-document', 'action', 'content', 'value',
     ]
 
-    # Method 1: All tags with URL-bearing attributes
-    for attr in url_attributes:
+    for attr in url_attrs:
         for tag in soup.find_all(attrs={attr: True}):
             val = tag.get(attr, '').strip()
-            if val and not val.startswith(('#', 'javascript:', 'mailto:')):
+            if val and not val.startswith(
+                ('#', 'javascript:', 'mailto:')
+            ):
                 if val.startswith('http'):
                     urls.add(val)
                 elif val.startswith('//'):
@@ -139,406 +179,258 @@ def extract_urls_from_html(html_string, base_url=""):
                 elif val.startswith('/') and base_url:
                     urls.add(urljoin(base_url, val))
 
-    # Method 2: URLs inside text content of any tag
-    # Catches <td>https://example.com/file.pdf</td>
-    for tag in soup.find_all(True):  # All tags
-        # Direct text content (not children)
+    # URLs in text content of any tag
+    for tag in soup.find_all(True):
         if tag.string:
-            text = tag.string.strip()
-            # Find URLs in text
             found = re.findall(
-                r'https?://[^\s<>"\']+',
-                text
+                r'https?://[^\s<>"\']+', tag.string
             )
             urls.update(found)
 
-        # Also check tag's direct text parts
-        for text_node in tag.find_all(string=True, recursive=False):
-            text = text_node.strip()
-            if text:
-                found = re.findall(
-                    r'https?://[^\s<>"\']+',
-                    text
-                )
-                urls.update(found)
-
-    # Method 3: onclick, onmousedown etc.
-    event_attrs = [
-        'onclick', 'onmousedown', 'onmouseup',
-        'onload', 'onerror'
-    ]
-    for attr in event_attrs:
+    # onclick handlers
+    for attr in ['onclick', 'onmousedown']:
         for tag in soup.find_all(attrs={attr: True}):
             val = tag.get(attr, '')
             found = re.findall(
-                r'["\']?(https?://[^\s"\'<>)+]+)["\']?',
-                val
+                r'["\']?(https?://[^\s"\'<>)]+)["\']?', val
             )
             urls.update(found)
-
-            # window.open('...')
             found2 = re.findall(
-                r'window\.open\s*\(\s*["\']([^"\']+)["\']',
-                val
+                r'window\.open\s*\(\s*["\']([^"\']+)', val
             )
             urls.update(found2)
 
-    # Method 4: style attributes with url()
-    for tag in soup.find_all(style=True):
-        style = tag.get('style', '')
-        found = re.findall(
-            r'url\s*\(\s*["\']?(https?://[^"\')\s]+)["\']?\s*\)',
-            style
-        )
-        urls.update(found)
-
     return urls
 
 
 # ─────────────────────────────────────────────
-# Extract URLs from JSON (recursive, with HTML)
+# MAIN: Parse HAR and collect body texts
 # ─────────────────────────────────────────────
-def extract_urls_from_json_deep(data, base_url=""):
+def parse_har_bodies(har_content):
     """
-    Recursively extract URLs from JSON data.
+    Parse HAR file and return list of
+    (mime_type, request_url, UNESCAPED body text).
     
-    CRITICAL: Also detects HTML strings inside JSON
-    values and parses them for URLs.
-    
-    Example JSON that this handles:
-    {
-        "content": "<a href='file.pdf'>Download</a>",
-        "url": "https:\\/\\/cdn.example.com\\/file.pdf",
-        "items": [{"link": "/uploads/report.pdf"}]
-    }
+    KEY: Bodies are unescaped BEFORE storing,
+    so HTML inside JSON becomes parseable HTML.
     """
-    urls = set()
-
-    def process_string(value, key=""):
-        """Process a single string value"""
-        if not value or not isinstance(value, str):
-            return
-
-        value = value.strip()
-        if len(value) < 4:
-            return
-
-        # ── Check if value IS a URL ──
-        if value.startswith(('http://', 'https://', '//')):
-            urls.add(value)
-
-        # Relative path that looks like a file
-        elif value.startswith('/') and '.' in value.split('/')[-1]:
-            if base_url:
-                urls.add(urljoin(base_url, value))
-
-        # ── Check if value CONTAINS URLs ──
-        # Normal URLs
-        found = re.findall(
-            r'https?://[^\s"\'<>\\,;\]})]+',
-            value
-        )
-        urls.update(found)
-
-        # Escaped URLs
-        found_esc = re.findall(
-            r'https?:\\{1,4}/\\{0,4}/[^\s"\'<>,;\]})]+',
-            value
-        )
-        urls.update(found_esc)
-
-        # ── Check if value contains HTML ──
-        # This is the KEY feature for sites like Shriram Finance
-        # where API returns HTML fragments as JSON string values
-        if any(marker in value for marker in [
-            '<a ', '<a\n', '<td', '<div', '<span',
-            '<p ', '<li', '<tr', 'href=', 'src=',
-            '<table', '<ul', '<ol', '<iframe',
-            '<embed', '<object',
-        ]):
-            html_urls = extract_urls_from_html(value, base_url)
-            urls.update(html_urls)
-
-    def recurse(obj):
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if isinstance(value, str):
-                    process_string(value, key)
-                else:
-                    recurse(value)
-        elif isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, str):
-                    process_string(item)
-                else:
-                    recurse(item)
-        elif isinstance(obj, str):
-            process_string(obj)
-
-    recurse(data)
-    return urls
-
-
-# ─────────────────────────────────────────────
-# MAIN: Extract everything from HAR
-# ─────────────────────────────────────────────
-def extract_all_from_har(har_content):
-    """
-    Extract ALL URLs from HAR file using multiple methods:
-    
-    1. Request URLs
-    2. Response headers
-    3. Response bodies — parsed as:
-       a. JSON → recursive extraction + HTML-in-JSON
-       b. HTML → full BeautifulSoup parse
-       c. JavaScript → regex extraction
-       d. Any text → regex extraction
-    4. POST data
-    5. Regex on raw body text for custom patterns
-    
-    Returns: (all_urls, body_texts)
-      - all_urls: set of extracted URLs
-      - body_texts: list of (mime_type, body) for regex matching
-    """
-    all_urls = set()
-    body_texts = []  # Store bodies for custom regex later
+    bodies = []
+    log = []
 
     try:
         har_data = json.loads(har_content)
     except json.JSONDecodeError as e:
         st.error(f"Invalid HAR file: {e}")
-        return set(), []
+        return [], log
 
     entries = har_data.get('log', {}).get('entries', [])
     if not entries:
         st.error("No entries found in HAR file")
-        return set(), []
+        return [], log
+
+    log.append(f"HAR file has {len(entries)} entries")
 
     for entry in entries:
         request = entry.get('request', {})
         response = entry.get('response', {})
-
-        # Determine base URL from request
         req_url = request.get('url', '')
-        if req_url:
-            all_urls.add(req_url)
-            try:
-                from urllib.parse import urlparse as _urlparse
-                _p = _urlparse(req_url)
-                base_url = f"{_p.scheme}://{_p.netloc}"
-            except Exception:
-                base_url = ""
-        else:
-            base_url = ""
-
-        # ── Request headers ──
-        for header in request.get('headers', []):
-            val = header.get('value', '')
-            if 'http' in val.lower():
-                found = re.findall(
-                    r'https?://[^\s"\'<>\\,;]+', val
-                )
-                all_urls.update(found)
-
-        # ── POST data ──
-        post_text = request.get('postData', {}).get('text', '')
-        if post_text:
-            found = re.findall(
-                r'https?://[^\s"\'<>\\,;]+', post_text
-            )
-            all_urls.update(found)
-            found_esc = re.findall(
-                r'https?:\\{1,4}/\\{0,4}/[^\s"\'<>,;]+', post_text
-            )
-            all_urls.update(found_esc)
-
-        # ── Response headers ──
-        for header in response.get('headers', []):
-            name = header.get('name', '').lower()
-            val = header.get('value', '')
-            if name in [
-                'location', 'content-location', 'link',
-                'x-redirect', 'refresh'
-            ]:
-                found = re.findall(
-                    r'https?://[^\s"\'<>;]+', val
-                )
-                all_urls.update(found)
-
-        # ── Response body ──
         content = response.get('content', {})
         body = content.get('text', '')
-        if not body:
+
+        if not body or len(body) < 20:
             continue
 
         mime = content.get('mimeType', '').lower()
 
-        # Store body for custom regex later
-        body_texts.append((mime, req_url, body))
+        # ── CRITICAL: Unescape the body ──
+        # HAR stores body as JSON string value, so HTML
+        # like <a href="..."> becomes <a href=\\\"...\\\">
+        # We must unescape it to get real HTML
+        unescaped = unescape_json_string(body)
 
-        # ── Parse based on content type ──
+        bodies.append((mime, req_url, unescaped))
 
-        # JSON response
+        # For JSON bodies, also try to parse and extract
+        # HTML values from within the JSON
         if ('json' in mime
-                or body.strip().startswith(('{', '['))):
+                or unescaped.strip().startswith(('{', '['))):
             try:
-                data = json.loads(body)
-                json_urls = extract_urls_from_json_deep(
-                    data, base_url
-                )
-                all_urls.update(json_urls)
+                data = json.loads(unescaped)
+                html_fragments = extract_html_from_json(data)
+                for fragment in html_fragments:
+                    # Each fragment is already unescaped by
+                    # json.loads, but might still need cleanup
+                    clean_fragment = unescape_json_string(fragment)
+                    if '<' in clean_fragment and '>' in clean_fragment:
+                        bodies.append((
+                            'text/html (from json)',
+                            req_url,
+                            clean_fragment
+                        ))
             except json.JSONDecodeError:
                 pass
 
-            # Also regex on raw JSON text
-            found = re.findall(
-                r'https?://[^\s"\'<>\\,;\]})]+', body
-            )
-            all_urls.update(found)
-            found_esc = re.findall(
-                r'https?:\\{1,4}/\\{0,4}/[^\s"\'<>,;\]})]+',
-                body
-            )
-            all_urls.update(found_esc)
+    log.append(
+        f"Collected {len(bodies)} response bodies "
+        f"(including HTML extracted from JSON)"
+    )
+    return bodies, log
 
-        # HTML response
-        elif 'html' in mime:
-            html_urls = extract_urls_from_html(body, base_url)
-            all_urls.update(html_urls)
 
-            # Also regex
-            found = re.findall(
-                r'https?://[^\s"\'<>]+', body
-            )
-            all_urls.update(found)
+def extract_html_from_json(data):
+    """
+    Recursively find string values in JSON that contain HTML.
+    Returns list of HTML strings.
+    """
+    html_strings = []
 
-        # JavaScript
-        elif 'javascript' in mime or 'script' in mime:
-            found = re.findall(
-                r'https?://[^\s"\'<>\\,;]+', body
-            )
-            all_urls.update(found)
-            found_esc = re.findall(
-                r'https?:\\{1,4}/\\{0,4}/[^\s"\'<>,;]+',
-                body
-            )
-            all_urls.update(found_esc)
+    def recurse(obj):
+        if isinstance(obj, dict):
+            for value in obj.values():
+                if isinstance(value, str):
+                    check(value)
+                else:
+                    recurse(value)
+        elif isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, str):
+                    check(item)
+                else:
+                    recurse(item)
 
-        # XML / RSS / Atom
-        elif 'xml' in mime:
-            found = re.findall(
-                r'https?://[^\s"\'<>]+', body
-            )
-            all_urls.update(found)
+    def check(value):
+        if not value or len(value) < 20:
+            return
+        # Does this string contain HTML?
+        html_indicators = [
+            '<a ', '<a\n', '<a\t', '<div', '<span',
+            '<td', '<tr', '<table', '<p ', '<p>',
+            '<li', '<ul', '<ol', '<article',
+            '<section', '<iframe', '<embed',
+            'href=', 'src=',
+        ]
+        value_lower = value.lower()
+        if any(ind in value_lower for ind in html_indicators):
+            html_strings.append(value)
 
-        # Anything else with text
-        else:
-            if isinstance(body, str) and len(body) > 10:
-                found = re.findall(
-                    r'https?://[^\s"\'<>]+', body
-                )
-                all_urls.update(found)
-
-    return all_urls, body_texts
+    recurse(data)
+    return html_strings
 
 
 # ─────────────────────────────────────────────
-# Apply custom regex on raw HAR bodies
+# Apply regex on bodies
 # ─────────────────────────────────────────────
-def apply_custom_regex(body_texts, regex_pattern):
+def apply_regex(bodies, pattern):
     """
-    Run a user-provided regex against ALL response
-    bodies in the HAR file.
-    
-    This lets users find URLs that standard extraction
-    might miss, using patterns like:
-    - https://.*\\.pdf
-    - href="([^"]*\\.pdf)"
-    - <td[^>]*>([^<]*\\.pdf[^<]*)</td>
+    Run regex on all response bodies.
+    Returns list of (matched_string, source_url, mime).
     """
-    matches = set()
+    results = []
+    seen = set()
 
     try:
-        compiled = re.compile(regex_pattern, re.IGNORECASE)
+        compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
         st.error(f"Invalid regex: {e}")
-        return matches
+        return results
 
-    for mime, req_url, body in body_texts:
+    for mime, req_url, body in bodies:
         if not body:
             continue
 
         found = compiled.findall(body)
         for match in found:
-            # findall returns groups if pattern has groups
+            # Handle groups
             if isinstance(match, tuple):
                 for m in match:
-                    if m:
-                        matches.add(m)
+                    if m and m not in seen:
+                        seen.add(m)
+                        results.append((m, req_url, mime))
             else:
-                if match:
-                    matches.add(match)
+                if match and match not in seen:
+                    seen.add(match)
+                    results.append((match, req_url, mime))
 
-    return matches
+    return results
 
 
 # ─────────────────────────────────────────────
-# Filter and clean URLs
+# Apply keyword filter on bodies
 # ─────────────────────────────────────────────
-def filter_urls(all_urls, include_keywords, exclude_keywords):
+def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
     """
-    Filter URLs by include/exclude keywords.
-    Keywords support simple string matching (not regex).
+    Extract URLs from bodies that match include keywords.
+    
+    Process:
+    1. For each body, extract ALL URLs (from HTML + raw regex)
+    2. Clean each URL
+    3. Keep only those matching include keywords
+    4. Remove those matching exclude keywords
     """
     results = []
     seen = set()
 
-    inc_kws = [
-        kw.strip().lower() for kw in include_keywords if kw.strip()
-    ]
-    exc_kws = [
-        kw.strip().lower() for kw in exclude_keywords if kw.strip()
-    ]
+    inc_kws = [kw.strip().lower() for kw in include_keywords if kw.strip()]
+    exc_kws = [kw.strip().lower() for kw in exclude_keywords if kw.strip()]
 
-    # Always exclude these
-    auto_exclude = [
+    # Auto-exclude
+    auto_exc = [
         '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
-        '.ico', '.bmp', '.tiff',
-        '.css', '.woff', '.woff2', '.ttf', '.eot',
-        '.mp4', '.mp3', '.avi', '.mov', '.webm',
-        'google-analytics.com', 'googletagmanager.com',
+        '.ico', '.bmp', '.css', '.woff', '.woff2', '.ttf',
+        '.eot', '.mp4', '.mp3', '.avi', '.webm',
+        'google-analytics', 'googletagmanager',
         'facebook.com/tr', 'doubleclick.net',
-        'pixel', 'beacon', 'tracker',
     ]
-    all_exc = exc_kws + auto_exclude
+    all_exc = exc_kws + auto_exc
 
-    for raw_url in all_urls:
-        cleaned = clean_url(raw_url)
-        if not cleaned:
-            continue
-        if cleaned in seen:
+    for mime, req_url, body in bodies:
+        if not body:
             continue
 
-        cleaned_lower = cleaned.lower()
+        found_urls = set()
 
-        # Exclude check
-        if any(exc in cleaned_lower for exc in all_exc):
-            continue
+        # Determine base URL
+        try:
+            from urllib.parse import urlparse as _up
+            _p = _up(req_url)
+            base = f"{_p.scheme}://{_p.netloc}" if _p.scheme else ""
+        except Exception:
+            base = ""
 
-        # Include check — must match at least one keyword
-        if inc_kws:
+        # Extract URLs based on content type
+        if '<' in body and '>' in body:
+            # Has HTML — parse it
+            html_urls = extract_urls_from_html(body, base)
+            found_urls.update(html_urls)
+
+        # Also regex extract from raw text
+        raw_urls = re.findall(
+            r'https?://[^\s"\'<>\\,;\]})]+', body
+        )
+        found_urls.update(raw_urls)
+
+        # Filter each URL
+        for raw_url in found_urls:
+            cleaned = clean_url(raw_url)
+            if not cleaned or cleaned in seen:
+                continue
+
+            cl = cleaned.lower()
+
+            # Exclude check
+            if any(e in cl for e in all_exc):
+                continue
+
+            # Include check
             matched = None
             for kw in inc_kws:
-                if kw in cleaned_lower:
+                if kw in cl:
                     matched = kw
                     break
-            if not matched:
-                continue
-        else:
-            matched = "no-filter"
 
-        seen.add(cleaned)
-        results.append((cleaned, matched))
+            if matched:
+                seen.add(cleaned)
+                results.append((cleaned, matched, req_url))
 
     results.sort(key=lambda x: x[0].split('/')[-1].lower())
     return results
@@ -548,7 +440,7 @@ def filter_urls(all_urls, include_keywords, exclude_keywords):
 # Generate TXT
 # ─────────────────────────────────────────────
 def generate_txt(results, source, inc_kw, exc_kw,
-                 html_regex="", pdf_regex=""):
+                 pdf_regex="", html_regex=""):
     lines = [
         "=" * 70,
         "URL EXTRACTION REPORT",
@@ -556,7 +448,7 @@ def generate_txt(results, source, inc_kw, exc_kw,
         f"Source       : {source}",
         f"Date         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Total URLs   : {len(results)}",
-        f"Include      : {', '.join(inc_kw)}",
+        f"Include      : {', '.join(inc_kw) if inc_kw else 'none'}",
         f"Exclude      : {len(exc_kw)} patterns",
     ]
     if pdf_regex:
@@ -566,16 +458,18 @@ def generate_txt(results, source, inc_kw, exc_kw,
 
     lines.extend(["=" * 70, "", "── EXTRACTED URLS ──", ""])
 
-    for i, (url, kw) in enumerate(results, 1):
+    for i, item in enumerate(results, 1):
+        url = item[0]
+        matched_by = item[1]
         fname = url.split('/')[-1].split('?')[0]
         lines.append(f"{i:4d}. {fname}")
         lines.append(f"      {url}")
-        lines.append(f"      [matched: {kw}]")
+        lines.append(f"      [matched: {matched_by}]")
         lines.append("")
 
     lines.extend(["=" * 70, "", "── PLAIN URL LIST ──", ""])
-    for url, _ in results:
-        lines.append(url)
+    for item in results:
+        lines.append(item[0])
 
     lines.extend(["", "=" * 70, "END"])
     return "\n".join(lines)
@@ -587,30 +481,26 @@ def generate_txt(results, source, inc_kw, exc_kw,
 
 st.title("📄 HAR File → URL Extractor")
 st.markdown(
-    "Upload `.har` file → Extract **PDF links, HTML links, "
-    "or any URL** using keywords + regex → Download as `.txt`"
+    "Upload `.har` → Extract **PDF links, HTML page links, "
+    "or any URL** using keywords + regex"
 )
 
-# ── How-to ──
-with st.expander("📖 How to capture a .har file", expanded=False):
+with st.expander("📖 How to capture .har file"):
     st.markdown("""
-    1. **Open Chrome** → go to target website
-    2. **Press F12** → **Network** tab
-    3. **Check "Preserve log"**
-    4. **Click ALL tabs/buttons** on the page
-    5. **Right-click** in Network list → **Save all as HAR with content**
-    6. **Upload** that `.har` file below
+    1. Open Chrome → target website
+    2. F12 → Network tab → Check **"Preserve log"**
+    3. **Click ALL tabs/buttons** on the page
+    4. Right-click Network list → **Save all as HAR with content**
+    5. Upload here
     """)
 
 st.markdown("---")
 
 # ─────────────────────────────────────────────
-# FILE UPLOAD
+# UPLOAD
 # ─────────────────────────────────────────────
 uploaded_file = st.file_uploader(
-    "📁 Upload .har file",
-    type=['har'],
-    help="From Chrome DevTools → Network → Save all as HAR"
+    "📁 Upload .har file", type=['har']
 )
 
 # ─────────────────────────────────────────────
@@ -619,87 +509,82 @@ uploaded_file = st.file_uploader(
 st.markdown("---")
 st.subheader("🔧 Extraction Settings")
 
-# Row 1: Keywords
-kw_col1, kw_col2 = st.columns(2)
-
-with kw_col1:
-    st.markdown("**✅ Include Keywords** (URL must contain ≥1)")
-    include_input = st.text_input(
-        "Include keywords (separate with |)",
-        value=".pdf",
-        placeholder=".pdf|/download/|getfile",
-        help=(
-            "URL must contain at least ONE of these.\n"
-            "Examples: .pdf | .pdf|.xlsx | .pdf|/documents/"
-        ),
-        key="include_kw"
-    )
-
-with kw_col2:
-    st.markdown("**❌ Exclude Keywords** (URL must NOT contain)")
-    exclude_input = st.text_input(
-        "Exclude keywords (separate with |)",
-        value=".jpg|.jpeg|.png|.gif|.svg|.webp|.ico|.css|.woff|.woff2",
-        placeholder=".jpg|.png|facebook",
-        key="exclude_kw"
-    )
-
-# Row 2: Regex patterns
-st.markdown("---")
-st.subheader("🔍 Regex Patterns (Advanced)")
-st.caption(
-    "Run regex directly on raw HAR response bodies. "
-    "Finds URLs that keyword filtering might miss. "
-    "Use capture groups `()` to extract the URL part."
+st.markdown(
+    "**Use Keywords OR Regex or BOTH.** "
+    "Results from all methods are combined."
 )
 
-rx_col1, rx_col2 = st.columns(2)
+# Keywords
+kw1, kw2 = st.columns(2)
+with kw1:
+    st.markdown("**✅ Include Keywords** — URL must contain ≥1")
+    include_input = st.text_input(
+        "Include (separate with |)",
+        value=".pdf",
+        placeholder=".pdf|/download/|.xlsx",
+        key="inc"
+    )
+with kw2:
+    st.markdown("**❌ Exclude Keywords** — URL must NOT contain")
+    exclude_input = st.text_input(
+        "Exclude (separate with |)",
+        value=".jpg|.jpeg|.png|.gif|.svg|.webp|.ico|.css|.woff|.woff2",
+        placeholder=".jpg|.png|facebook",
+        key="exc"
+    )
 
-with rx_col1:
-    st.markdown("**📄 PDF/Document URL Regex**")
+# Regex
+st.markdown("---")
+st.subheader("🔍 Regex Patterns")
+st.caption(
+    "Regex runs on **unescaped** response bodies. "
+    "Use `()` capture group to extract the URL part. "
+    "Leave blank to skip."
+)
+
+rx1, rx2 = st.columns(2)
+with rx1:
+    st.markdown("**📄 PDF / Document Regex**")
     pdf_regex = st.text_input(
-        "PDF regex pattern",
+        "PDF regex",
         value="",
-        placeholder=r'https?://[^\s"\\]+\.pdf[^\s"\\]*',
+        placeholder=r'https?://[^\s"<>]+\.pdf[^\s"<>]*',
         help=(
-            "Examples:\n\n"
-            r'`https?://[^\s"\\]+\.pdf[^\s"\\]*`'
-            " — any URL ending in .pdf\n\n"
-            r'`https?://cdn\.example\.com/[^\s"\\]+\.pdf`'
-            " — PDFs from specific CDN\n\n"
-            r'`"file_url"\s*:\s*"([^"]+\.pdf[^"]*)`'
-            " — PDF URL from JSON key\n\n"
-            r'`/uploads/[^\s"\\]+\.pdf`'
-            " — relative PDF paths"
+            "Runs on raw response text.\n\n"
+            "Examples:\n"
+            r'`https?://[^\s"<>]+\.pdf`' " — any PDF URL\n\n"
+            r'`href="([^"]+\.pdf[^"]*)`' " — PDF in href\n\n"
+            r'`"url"\s*:\s*"([^"]+\.pdf)`' " — PDF in JSON"
         ),
-        key="pdf_regex"
+        key="pdf_rx"
     )
 
-with rx_col2:
-    st.markdown("**🌐 HTML/Page URL Regex**")
+with rx2:
+    st.markdown("**🌐 HTML / Page Link Regex**")
     html_regex = st.text_input(
-        "HTML link regex pattern",
+        "HTML regex",
         value="",
-        placeholder=r'href=["\']([^"\']+)["\']',
+        placeholder=r'href="([^"]+communique[^"]*)"',
         help=(
-            "Examples:\n\n"
-            r'`href=["\']([^"\']+)["\']`'
+            "Extract HTML page links by pattern.\n\n"
+            "Examples:\n"
+            r'`href="([^"]+)"'
             " — all href values\n\n"
-            r'`href=["\']([^"\']*investor[^"\']*)["\']`'
-            " — hrefs containing 'investor'\n\n"
-            r'`<td[^>]*>\s*(https?://[^<]+)\s*</td>`'
-            " — URLs inside <td> tags\n\n"
-            r'`<a[^>]+href=["\']([^"\']+\.pdf)["\']`'
-            " — PDF links in anchor tags\n\n"
-            r'`data-url=["\']([^"\']+)["\']`'
-            " — data-url attribute values\n\n"
-            r'`window\.open\(["\']([^"\']+)["\']`'
-            " — JavaScript window.open URLs"
+            r'`href="([^"]*communique[^"]*)"'
+            " — hrefs with 'communique'\n\n"
+            r'`href="([^"]*investor[^"]*)"'
+            " — hrefs with 'investor'\n\n"
+            r'`<a[^>]+href="([^"]+)"[^>]*>`'
+            " — full anchor tag hrefs\n\n"
+            r'`<td[^>]*>\s*(https?://[^<]+)</td>`'
+            " — URLs inside td tags\n\n"
+            r'`data-url="([^"]+)"'
+            " — data-url attributes"
         ),
-        key="html_regex"
+        key="html_rx"
     )
 
-# Parse keywords
+# Parse
 include_keywords = [
     kw.strip() for kw in include_input.split('|') if kw.strip()
 ]
@@ -707,22 +592,20 @@ exclude_keywords = [
     kw.strip() for kw in exclude_input.split('|') if kw.strip()
 ]
 
-# Active filter summary
-filter_parts = []
+# Summary
+parts = []
 if include_keywords:
-    filter_parts.append(f"Keywords: `{include_keywords}`")
+    parts.append(f"Keywords: `{include_keywords}`")
 if pdf_regex.strip():
-    filter_parts.append(f"PDF regex: `{pdf_regex}`")
+    parts.append(f"PDF regex active")
 if html_regex.strip():
-    filter_parts.append(f"HTML regex: `{html_regex}`")
-
+    parts.append(f"HTML regex active")
 st.info(
-    f"**Active filters:** {' | '.join(filter_parts) if filter_parts else 'None'} "
-    f"| Excluding: `{len(exclude_keywords)}` patterns"
+    f"**Filters:** {' | '.join(parts) if parts else 'None set'}"
 )
 
 # ─────────────────────────────────────────────
-# PROCESS
+# EXTRACT
 # ─────────────────────────────────────────────
 st.markdown("---")
 
@@ -734,157 +617,207 @@ if uploaded_file:
             'utf-8', errors='ignore'
         )
 
-    st.session_state.har_content_cache = har_content
     file_mb = len(har_content) / (1024 * 1024)
     st.caption(f"📁 {uploaded_file.name} | {file_mb:.1f} MB")
 
-    if st.button(
-        "🚀 Extract URLs", type="primary", key="extract"
-    ):
-        with st.spinner("Parsing HAR file..."):
-            # ── Step 1: Standard + deep extraction ──
-            all_urls, body_texts = extract_all_from_har(har_content)
-            st.session_state.body_texts = body_texts
+    if st.button("🚀 Extract URLs", type="primary", key="go"):
 
-            # ── Step 2: Apply custom regex on raw bodies ──
-            regex_urls = set()
+        with st.spinner("Parsing HAR file & unescaping bodies..."):
+            bodies, parse_log = parse_har_bodies(har_content)
+            st.session_state.body_texts = bodies
+            st.session_state.extraction_log = parse_log
 
-            if pdf_regex.strip():
-                with st.spinner("Applying PDF regex..."):
-                    pdf_matches = apply_custom_regex(
-                        body_texts, pdf_regex.strip()
-                    )
-                    regex_urls.update(pdf_matches)
-                    st.info(
-                        f"PDF regex matched {len(pdf_matches)} items"
-                    )
+        all_results = []  # (url, matched_by, source_url)
+        seen_urls = set()
 
-            if html_regex.strip():
-                with st.spinner("Applying HTML regex..."):
-                    html_matches = apply_custom_regex(
-                        body_texts, html_regex.strip()
-                    )
-                    regex_urls.update(html_matches)
-                    st.info(
-                        f"HTML regex matched {len(html_matches)} items"
-                    )
+        # ── Method 1: Keyword filtering ──
+        if include_keywords:
+            with st.spinner("Applying keyword filter..."):
+                kw_results = apply_keyword_filter(
+                    bodies, include_keywords, exclude_keywords
+                )
+                for url, matched, source in kw_results:
+                    if url not in seen_urls:
+                        seen_urls.add(url)
+                        all_results.append(
+                            (url, f"keyword: {matched}", source)
+                        )
+                st.session_state.keyword_matches = kw_results
 
-            # Combine all sources
-            combined = all_urls | regex_urls
-            st.session_state.raw_urls = sorted(list(combined))
-
-            # ── Step 3: Filter ──
-            # For regex results, add them directly
-            # (they already matched user's pattern)
-            filtered = filter_urls(
-                combined, include_keywords, exclude_keywords
-            )
-
-            # Also add cleaned regex results that might not
-            # match keywords but DID match regex
-            if regex_urls:
-                existing = {url for url, _ in filtered}
-                for raw in regex_urls:
+        # ── Method 2: PDF regex ──
+        if pdf_regex.strip():
+            with st.spinner("Applying PDF regex..."):
+                pdf_matches = apply_regex(bodies, pdf_regex.strip())
+                regex_added = 0
+                for raw, source, mime in pdf_matches:
                     cleaned = clean_url(raw)
-                    if cleaned and cleaned not in existing:
-                        # Check exclusions only
+                    if not cleaned:
+                        # Might be a relative path — try as-is
+                        if raw.startswith('/'):
+                            cleaned = raw
+                        else:
+                            continue
+
+                    if cleaned not in seen_urls:
+                        # Check excludes
+                        cl = cleaned.lower()
                         exc_lower = [
                             e.lower() for e in exclude_keywords
                         ]
-                        if not any(
-                            e in cleaned.lower() for e in exc_lower
-                        ):
-                            source = "pdf-regex" if pdf_regex else "html-regex"
-                            filtered.append((cleaned, source))
-                            existing.add(cleaned)
+                        if any(e in cl for e in exc_lower):
+                            continue
+                        seen_urls.add(cleaned)
+                        all_results.append(
+                            (cleaned, "pdf-regex", source)
+                        )
+                        regex_added += 1
 
-            st.session_state.filtered_links = filtered
-            st.session_state.har_loaded = True
+                st.session_state.regex_matches = [
+                    (clean_url(r) or r, s, m)
+                    for r, s, m in pdf_matches
+                ]
+
+        # ── Method 3: HTML regex ──
+        if html_regex.strip():
+            with st.spinner("Applying HTML regex..."):
+                html_matches = apply_regex(
+                    bodies, html_regex.strip()
+                )
+                for raw, source, mime in html_matches:
+                    cleaned = clean_url(raw)
+                    if not cleaned:
+                        if raw.startswith('/'):
+                            # Try to build full URL from source
+                            try:
+                                from urllib.parse import urlparse
+                                p = urlparse(source)
+                                cleaned = f"{p.scheme}://{p.netloc}{raw}"
+                            except Exception:
+                                cleaned = raw
+                        else:
+                            continue
+
+                    if cleaned not in seen_urls:
+                        cl = cleaned.lower()
+                        exc_lower = [
+                            e.lower() for e in exclude_keywords
+                        ]
+                        if any(e in cl for e in exc_lower):
+                            continue
+                        seen_urls.add(cleaned)
+                        all_results.append(
+                            (cleaned, "html-regex", source)
+                        )
+
+        # Sort
+        all_results.sort(
+            key=lambda x: x[0].split('/')[-1].lower()
+        )
+        st.session_state.filtered_links = all_results
+        st.session_state.har_loaded = True
 
         # Metrics
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3 = st.columns(3)
         with m1:
-            st.metric("🔗 Total Raw URLs", len(combined))
+            kw_count = len([
+                r for r in all_results if 'keyword' in r[1]
+            ])
+            st.metric("🔑 Keyword Matches", kw_count)
         with m2:
-            st.metric("📄 After Filtering", len(filtered))
+            rx_count = len([
+                r for r in all_results if 'regex' in r[1]
+            ])
+            st.metric("🔍 Regex Matches", rx_count)
         with m3:
-            st.metric(
-                "🔍 Regex Matches",
-                len(regex_urls) if regex_urls else 0
-            )
-        with m4:
-            st.metric(
-                "🚫 Excluded",
-                len(combined) - len(filtered)
-            )
+            st.metric("📄 Total URLs", len(all_results))
 
 
 # ─────────────────────────────────────────────
-# RESULTS
+# RESULTS — ONLY MATCHED ITEMS
 # ─────────────────────────────────────────────
 if st.session_state.har_loaded and st.session_state.filtered_links:
     st.markdown("---")
-    count = len(st.session_state.filtered_links)
-    st.header(f"📄 {count} URLs Extracted")
+    total = len(st.session_state.filtered_links)
+    st.header(f"📄 {total} URLs Found")
 
-    # Re-filter button
+    # Re-filter
     if st.button("🔄 Re-apply Filters", key="refilter"):
-        # Re-run regex if bodies are cached
-        regex_urls = set()
-        if pdf_regex.strip() and st.session_state.body_texts:
-            regex_urls.update(
-                apply_custom_regex(
-                    st.session_state.body_texts,
-                    pdf_regex.strip()
-                )
-            )
-        if html_regex.strip() and st.session_state.body_texts:
-            regex_urls.update(
-                apply_custom_regex(
-                    st.session_state.body_texts,
-                    html_regex.strip()
-                )
-            )
+        # Re-run everything
+        bodies = st.session_state.body_texts
+        all_results = []
+        seen_urls = set()
 
-        combined = set(st.session_state.raw_urls) | regex_urls
-        filtered = filter_urls(
-            combined, include_keywords, exclude_keywords
-        )
+        if include_keywords:
+            kw_results = apply_keyword_filter(
+                bodies, include_keywords, exclude_keywords
+            )
+            for url, matched, source in kw_results:
+                if url not in seen_urls:
+                    seen_urls.add(url)
+                    all_results.append(
+                        (url, f"keyword: {matched}", source)
+                    )
 
-        if regex_urls:
-            existing = {u for u, _ in filtered}
-            exc_lower = [e.lower() for e in exclude_keywords]
-            for raw in regex_urls:
+        if pdf_regex.strip():
+            pdf_matches = apply_regex(bodies, pdf_regex.strip())
+            for raw, source, mime in pdf_matches:
+                cleaned = clean_url(raw) or raw
+                if cleaned not in seen_urls:
+                    cl = cleaned.lower()
+                    exc_l = [e.lower() for e in exclude_keywords]
+                    if not any(e in cl for e in exc_l):
+                        seen_urls.add(cleaned)
+                        all_results.append(
+                            (cleaned, "pdf-regex", source)
+                        )
+
+        if html_regex.strip():
+            html_matches = apply_regex(bodies, html_regex.strip())
+            for raw, source, mime in html_matches:
                 cleaned = clean_url(raw)
-                if cleaned and cleaned not in existing:
-                    if not any(
-                        e in cleaned.lower() for e in exc_lower
-                    ):
-                        filtered.append((cleaned, "regex"))
-                        existing.add(cleaned)
+                if not cleaned and raw.startswith('/'):
+                    try:
+                        from urllib.parse import urlparse
+                        p = urlparse(source)
+                        cleaned = f"{p.scheme}://{p.netloc}{raw}"
+                    except Exception:
+                        cleaned = raw
+                if cleaned and cleaned not in seen_urls:
+                    cl = cleaned.lower()
+                    exc_l = [e.lower() for e in exclude_keywords]
+                    if not any(e in cl for e in exc_l):
+                        seen_urls.add(cleaned)
+                        all_results.append(
+                            (cleaned, "html-regex", source)
+                        )
 
-        st.session_state.filtered_links = filtered
+        all_results.sort(
+            key=lambda x: x[0].split('/')[-1].lower()
+        )
+        st.session_state.filtered_links = all_results
         st.rerun()
 
-    # Display
-    st.markdown("### Extracted URLs:")
+    # ── Display only matched results ──
+    st.markdown("### Matched URLs Only:")
 
-    for i, (url, kw) in enumerate(
+    for i, (url, matched_by, source) in enumerate(
         st.session_state.filtered_links, 1
     ):
         fname = url.split('/')[-1].split('?')[0]
-        if len(fname) > 80:
-            fname = fname[:77] + "..."
+        if len(fname) > 70:
+            fname = fname[:67] + "..."
+        if not fname:
+            fname = url[:60]
 
-        c1, c2, c3, c4 = st.columns([0.4, 2.5, 5, 1.5])
+        c1, c2, c3, c4 = st.columns([0.4, 3, 4.5, 2])
         with c1:
-            st.text(f"{i:3d}.")
+            st.text(f"{i}.")
         with c2:
             st.text(f"📄 {fname}")
         with c3:
             st.markdown(f"[Open Link]({url})")
         with c4:
-            st.caption(f"via: {kw}")
+            st.caption(matched_by)
 
     # ── Downloads ──
     st.markdown("---")
@@ -894,7 +827,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
 
     with d1:
         plain = "\n".join(
-            u for u, _ in st.session_state.filtered_links
+            u for u, _, _ in st.session_state.filtered_links
         )
         st.download_button(
             "📝 URLs Only (.txt)",
@@ -911,7 +844,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             st.session_state.filtered_links,
             uploaded_file.name if uploaded_file else "unknown",
             include_keywords, exclude_keywords,
-            html_regex, pdf_regex
+            pdf_regex, html_regex
         )
         st.download_button(
             "📋 Full Report (.txt)",
@@ -923,12 +856,14 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
         )
 
     with d3:
-        csv_lines = ["index,filename,url,matched_by"]
-        for i, (url, kw) in enumerate(
+        csv_lines = ["index,filename,url,matched_by,source"]
+        for i, (url, mb, src) in enumerate(
             st.session_state.filtered_links, 1
         ):
             fn = url.split('/')[-1].split('?')[0].replace(',', '_')
-            csv_lines.append(f'{i},"{fn}","{url}","{kw}"')
+            csv_lines.append(
+                f'{i},"{fn}","{url}","{mb}","{src[:80]}"'
+            )
         st.download_button(
             "📊 CSV (.csv)",
             data="\n".join(csv_lines),
@@ -938,68 +873,39 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             mime="text/csv"
         )
 
-    # Copy-paste box
+    # Copy box
     st.markdown("---")
     st.subheader("📋 Copy-Paste")
     st.text_area(
         "All URLs",
         value="\n".join(
-            u for u, _ in st.session_state.filtered_links
+            u for u, _, _ in st.session_state.filtered_links
         ),
-        height=250,
-        key="copy_box"
+        height=200,
+        key="copy"
     )
 
 
 # ─────────────────────────────────────────────
-# DEBUG
+# DEBUG — only matched, with body search
 # ─────────────────────────────────────────────
 if st.session_state.har_loaded:
+    st.markdown("---")
+    st.subheader("🔧 Debug Tools")
 
-    # Raw URL search
-    with st.expander(
-        f"🔧 Debug: {len(st.session_state.raw_urls)} raw URLs"
-    ):
-        st.caption(
-            "Search here if URLs are missing. "
-            "Then adjust keywords or regex above."
-        )
-
-        search = st.text_input(
-            "🔍 Search",
-            placeholder="pdf, report, annual, download...",
-            key="search_raw"
-        )
-
-        show_urls = st.session_state.raw_urls
-        if search:
-            show_urls = [
-                u for u in show_urls
-                if search.lower() in u.lower()
-            ]
-            st.caption(f"{len(show_urls)} matches for '{search}'")
-
-        for i, url in enumerate(show_urls[:500], 1):
-            cleaned = clean_url(url)
-            if cleaned:
-                is_match = any(
-                    kw.lower() in cleaned.lower()
-                    for kw in include_keywords
-                )
-                icon = "📄" if is_match else "🔗"
-                st.text(f"{icon} {i}. {cleaned[:150]}")
-
-    # Response body search
+    # Body search — helps find the right regex
     if st.session_state.body_texts:
-        with st.expander("🔧 Debug: Search Response Bodies"):
+        with st.expander("🔍 Search Response Bodies"):
             st.caption(
-                "Search inside actual response content. "
-                "Useful for finding the right regex pattern."
+                "Search inside actual response content "
+                "to build the right regex."
             )
 
             body_search = st.text_input(
-                "🔍 Search in response bodies",
-                placeholder=".pdf, href, <td, document",
+                "Search term",
+                placeholder=(
+                    "communique, .pdf, investor, report..."
+                ),
                 key="body_search"
             )
 
@@ -1008,30 +914,48 @@ if st.session_state.har_loaded:
                 for mime, req_url, body in st.session_state.body_texts:
                     if body_search.lower() in body.lower():
                         match_count += 1
-                        with st.expander(
-                            f"📡 {mime[:30]} | {req_url[:80]}"
-                        ):
-                            # Find and highlight matches
-                            idx = body.lower().find(
-                                body_search.lower()
+
+                        st.markdown(f"**{match_count}. {mime}**")
+                        st.caption(f"From: {req_url[:100]}")
+
+                        # Show context around the match
+                        idx = body.lower().find(
+                            body_search.lower()
+                        )
+                        if idx >= 0:
+                            start = max(0, idx - 300)
+                            end = min(len(body), idx + 500)
+                            snippet = body[start:end]
+
+                            # Highlight the match
+                            st.code(snippet, language="html")
+                        else:
+                            st.code(body[:500], language="html")
+
+                        st.markdown("---")
+
+                        if match_count >= 15:
+                            st.caption(
+                                "Showing first 15 matches..."
                             )
-                            if idx >= 0:
-                                start = max(0, idx - 200)
-                                end = min(len(body), idx + 500)
-                                snippet = body[start:end]
-                                st.code(snippet, language="text")
-                            else:
-                                st.code(
-                                    body[:500], language="text"
-                                )
+                            break
 
-                            if match_count >= 20:
-                                break
+                if match_count == 0:
+                    st.warning(
+                        f"'{body_search}' not found in any "
+                        f"response body"
+                    )
+                else:
+                    st.success(
+                        f"Found in {match_count} response(s). "
+                        f"Use the context above to build your regex."
+                    )
 
-                st.caption(
-                    f"Found '{body_search}' in "
-                    f"{match_count} responses"
-                )
+    # Extraction log
+    if st.session_state.extraction_log:
+        with st.expander("📋 Extraction Log"):
+            for entry in st.session_state.extraction_log:
+                st.text(entry)
 
 
 # ─────────────────────────────────────────────
@@ -1040,84 +964,70 @@ if st.session_state.har_loaded:
 with st.sidebar:
     st.header("📖 Guide")
 
+    st.markdown("### Keywords (Simple)")
+    st.code(".pdf", language="text")
+    st.caption("URLs containing .pdf")
+    st.code(".pdf|.xlsx|.docx", language="text")
+    st.caption("Multiple file types")
+    st.code("communique-de-presse", language="text")
+    st.caption("HTML pages with this path")
+
+    st.markdown("### PDF Regex")
+    st.code(
+        r'https?://[^\s"<>]+\.pdf[^\s"<>]*',
+        language="text"
+    )
+    st.caption("Any PDF URL anywhere")
+
+    st.code(
+        r'"url"\s*:\s*"([^"]+\.pdf)',
+        language="text"
+    )
+    st.caption("PDF URL in JSON key 'url'")
+
+    st.markdown("### HTML Regex")
+    st.code(
+        r'href="([^"]+)"',
+        language="text"
+    )
+    st.caption("All href values")
+
+    st.code(
+        r'href="([^"]*communique[^"]*)"',
+        language="text"
+    )
+    st.caption("hrefs containing 'communique'")
+
+    st.code(
+        r'<a[^>]+href="([^"]+)"',
+        language="text"
+    )
+    st.caption("Anchor tag hrefs")
+
+    st.code(
+        r'<td[^>]*>\s*(https?://[^<]+)</td>',
+        language="text"
+    )
+    st.caption("URLs inside td tags")
+
+    st.code(
+        r'data-url="([^"]+)"',
+        language="text"
+    )
+    st.caption("data-url attributes")
+
+    st.markdown("---")
+    st.markdown("### Debugging")
     st.markdown("""
-    ### Extraction Methods
-    
-    **1. Keywords (simple)**
-    ```
-    .pdf          → URLs with .pdf
-    .pdf|.xlsx    → PDFs and Excel files
-    /investor/    → investor path URLs
-    ```
-
-    **2. PDF Regex (advanced)**
-    Find PDFs even in complex JSON:
-    """)
-
-    st.code(
-        r'https?://[^\s"\\]+\.pdf[^\s"\\]*',
-        language="text"
-    )
-    st.code(
-        r'"file_url"\s*:\s*"([^"]+\.pdf)',
-        language="text"
-    )
-    st.code(
-        r'/uploads/[^\s"\\]+\.pdf',
-        language="text"
-    )
-
-    st.markdown("""
-    **3. HTML Regex (advanced)**
-    Extract from HTML inside JSON:
-    """)
-
-    st.code(
-        r'href=["\']([^"\']+\.pdf[^"\']*)["\']',
-        language="text"
-    )
-    st.code(
-        r'<td[^>]*>\s*(https?://[^<]+)\s*</td>',
-        language="text"
-    )
-    st.code(
-        r'<a[^>]+href=["\']([^"\']+)["\'][^>]*>',
-        language="text"
-    )
-    st.code(
-        r'data-url=["\']([^"\']+)["\']',
-        language="text"
-    )
-
-    st.markdown("""
-    ---
-    
-    ### What Gets Parsed
-    
-    - ✅ JSON response bodies
-    - ✅ **HTML inside JSON** values
-    - ✅ HTML response bodies
-    - ✅ JavaScript files
-    - ✅ All HTML attributes
-      (`href`, `src`, `data-*`, `onclick`)
-    - ✅ Text inside `<td>`, `<span>`, `<div>`
-    - ✅ POST request data
-    - ✅ Redirect headers
-    - ✅ Escaped URLs (`\\/\\/`)
-    
-    ---
-    
-    ### Debugging Tips
-    
-    1. Check **"Debug: raw URLs"** section
-    2. **Search response bodies** for 
-       patterns you see in DevTools
-    3. Build regex based on what you find
-    4. Click **Re-apply Filters**
+    1. Use **Search Response Bodies**
+    2. Type what you're looking for
+    3. See the actual content
+    4. Build regex from context
+    5. Click **Re-apply Filters**
     """)
 
     st.markdown("---")
-    if st.button("🗑️ Clear All"):
+    if st.button("🗑️ Clear"):
         for k in list(st.session_state.keys()):
             del st.session_state[k]
         st.rerun()
