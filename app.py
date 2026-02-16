@@ -488,6 +488,9 @@ def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
 # ─────────────────────────────────────────────
 # Generate TXT
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# Generate TXT with <a href="..."> format
+# ─────────────────────────────────────────────
 def generate_txt(results, source, inc_kw, exc_kw,
                  pdf_regex="", html_regex=""):
     lines = [
@@ -510,18 +513,57 @@ def generate_txt(results, source, inc_kw, exc_kw,
 
     for i, (url, matched_by, src) in enumerate(results, 1):
         fname = url.split('/')[-1].split('?')[0]
-        lines.append(f"{i:4d}. {fname}")
-        lines.append(f"      {url}")
+        if not fname:
+            fname = url.split('/')[-2] if '/' in url else "link"
+        lines.append(f'{i:4d}. <a href="{url}">{fname}</a>')
         lines.append(f"      [matched: {matched_by}]")
         lines.append("")
 
-    lines.extend(["=" * 70, "", "── PLAIN URL LIST ──", ""])
+    lines.extend([
+        "=" * 70, "",
+        "── HTML LINKS (copy-paste into any HTML page) ──", ""
+    ])
+    for url, _, _ in results:
+        fname = url.split('/')[-1].split('?')[0]
+        if not fname:
+            fname = url.split('/')[-2] if '/' in url else "link"
+        lines.append(f'<a href="{url}">{fname}</a>')
+
+    lines.extend([
+        "", "=" * 70, "",
+        "── PLAIN URL LIST ──", ""
+    ])
     for url, _, _ in results:
         lines.append(url)
 
     lines.extend(["", "=" * 70, "END"])
     return "\n".join(lines)
 
+
+# ─────────────────────────────────────────────
+# Generate HTML-only output (just <a href> tags)
+# ─────────────────────────────────────────────
+def generate_html_links(results):
+    """
+    Generate clean file with ONLY <a href="..."> tags.
+    One per line. Ready to paste into HTML.
+    """
+    lines = []
+    for url, _, _ in results:
+        fname = url.split('/')[-1].split('?')[0]
+        if not fname:
+            fname = url.split('/')[-2] if '/' in url else "link"
+        # Clean filename for display text
+        # Remove extension for cleaner display
+        display = fname.replace('.pdf', '').replace('.xlsx', '')
+        display = display.replace('-', ' ').replace('_', ' ')
+        display = display.strip()
+        if not display:
+            display = fname
+
+        lines.append(f'<a href="{url}">{fname}</a>')
+
+    return "\n".join(lines)
 
 # ═════════════════════════════════════════════
 # UI
@@ -788,23 +830,46 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
         with c4:
             st.caption(matched_by)
 
-    # Downloads
+   # Downloads
     st.markdown("---")
     st.header("⬇️ Download")
 
-    d1, d2, d3 = st.columns(3)
+    d1, d2, d3, d4 = st.columns(4)
+
+    # Option 1: HTML <a href> links only
     with d1:
+        html_links = generate_html_links(
+            st.session_state.filtered_links
+        )
+        st.download_button(
+            '📝 HTML Links (.txt)',
+            data=html_links,
+            file_name=(
+                f"html_links_"
+                f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            ),
+            mime="text/plain",
+            type="primary",
+            help='Each URL as <a href="...">filename</a>'
+        )
+
+    # Option 2: Plain URLs
+    with d2:
         plain = "\n".join(
             u for u, _, _ in st.session_state.filtered_links
         )
         st.download_button(
-            "📝 URLs Only (.txt)",
+            "🔗 Plain URLs (.txt)",
             data=plain,
-            file_name=f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            file_name=(
+                f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            ),
             mime="text/plain",
-            type="primary"
+            help="Just URLs, one per line"
         )
-    with d2:
+
+    # Option 3: Full report
+    with d3:
         report = generate_txt(
             st.session_state.filtered_links,
             uploaded_file.name if uploaded_file else "unknown",
@@ -812,35 +877,56 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             pdf_regex, html_regex
         )
         st.download_button(
-            "📋 Report (.txt)",
+            "📋 Full Report (.txt)",
             data=report,
-            file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
-            mime="text/plain"
+            file_name=(
+                f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            ),
+            mime="text/plain",
+            help="Detailed report with all sections"
         )
-    with d3:
-        csv = ["index,filename,url,matched_by"]
+
+    # Option 4: CSV
+    with d4:
+        csv_lines = ["index,filename,url,matched_by"]
         for i, (u, m, _) in enumerate(
             st.session_state.filtered_links, 1
         ):
             fn = u.split('/')[-1].split('?')[0].replace(',', '_')
-            csv.append(f'{i},"{fn}","{u}","{m}"')
+            csv_lines.append(f'{i},"{fn}","{u}","{m}"')
         st.download_button(
             "📊 CSV (.csv)",
-            data="\n".join(csv),
-            file_name=f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            data="\n".join(csv_lines),
+            file_name=(
+                f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            ),
             mime="text/csv"
         )
 
+    # Copy-paste section with <a href> format
     st.markdown("---")
-    st.subheader("📋 Copy-Paste")
-    st.text_area(
-        "All URLs",
-        value="\n".join(
-            u for u, _, _ in st.session_state.filtered_links
-        ),
-        height=200,
-        key="copy"
+    st.subheader("📋 Copy-Paste (HTML format)")
+    html_links = generate_html_links(
+        st.session_state.filtered_links
     )
+    st.text_area(
+        'All URLs as <a href="..."> tags',
+        value=html_links,
+        height=250,
+        key="copy_html"
+    )
+
+    # Also show plain URLs
+    with st.expander("📋 Plain URLs (copy-paste)"):
+        plain = "\n".join(
+            u for u, _, _ in st.session_state.filtered_links
+        )
+        st.text_area(
+            "Plain URLs",
+            value=plain,
+            height=200,
+            key="copy_plain"
+        )
 
 # ─── Debug ───
 if st.session_state.har_loaded:
