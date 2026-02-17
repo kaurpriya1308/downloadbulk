@@ -24,36 +24,23 @@ for key, val in defaults.items():
     if key not in st.session_state:
         st.session_state[key] = val if not isinstance(val, list) else []
 
-
 # ─────────────────────────────────────────────
 # Date patterns
 # ─────────────────────────────────────────────
 DATE_PATTERNS = [
-    # 15 Jan 2025, 15 January 2025
     r'\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
-    # Jan 15, 2025 / January 15, 2025
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}',
-    # 2025-01-15
     r'\d{4}-\d{2}-\d{2}',
-    # 15/01/2025 or 01/15/2025
     r'\d{1,2}/\d{1,2}/\d{4}',
-    # 15-01-2025 or 01-15-2025
     r'\d{1,2}-\d{1,2}-\d{4}',
-    # 15.01.2025
     r'\d{1,2}\.\d{1,2}\.\d{4}',
-    # March 2025
     r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}',
-    # Q1 2025, Q2 FY2025
     r'Q[1-4]\s*(?:FY)?\s*\d{4}',
-    # FY 2024-25
     r'FY\s*\d{4}(?:-\d{2,4})?',
-    # 2024-25
     r'\d{4}-\d{2,4}',
 ]
-
 DATE_REGEX = re.compile(
-    '(' + '|'.join(DATE_PATTERNS) + ')',
-    re.IGNORECASE
+    '(' + '|'.join(DATE_PATTERNS) + ')', re.IGNORECASE
 )
 
 
@@ -63,7 +50,6 @@ DATE_REGEX = re.compile(
 def unescape_json_string(text):
     if not text or not isinstance(text, str):
         return ""
-
     s = text
     s = s.replace('\\u003c', '<')
     s = s.replace('\\u003e', '>')
@@ -71,7 +57,6 @@ def unescape_json_string(text):
     s = s.replace('\\u003d', '=')
     s = s.replace('\\u0022', '"')
     s = s.replace('\\u0027', "'")
-
     for _ in range(5):
         old = s
         s = s.replace('\\"', '"')
@@ -82,7 +67,6 @@ def unescape_json_string(text):
         s = s.replace('\\t', '\t')
         if s == old:
             break
-
     s = re.sub(r'\\+/', '/', s)
     s = s.strip()
     if s.startswith('"') and s.endswith('"'):
@@ -96,9 +80,7 @@ def unescape_json_string(text):
 def clean_url(url):
     if not url or not isinstance(url, str):
         return ""
-
     cleaned = url.strip().strip('"\'')
-
     for _ in range(5):
         old = cleaned
         cleaned = cleaned.replace('\\/', '/')
@@ -109,178 +91,138 @@ def clean_url(url):
         cleaned = cleaned.replace('\\u0026', '&')
         if cleaned == old:
             break
-
     cleaned = re.sub(r'\\+/', '/', cleaned)
-
     if '%2F' in cleaned or '%3A' in cleaned:
         try:
             cleaned = unquote(cleaned)
         except Exception:
             pass
-
     if cleaned.startswith('//'):
         cleaned = 'https:' + cleaned
     elif not cleaned.startswith('http'):
         return ""
-
     cleaned = cleaned.replace('\\', '/')
     cleaned = re.sub(r'(?<!:)/{2,}', '/', cleaned)
     cleaned = cleaned.rstrip('\\",;\')} \t\n\r>')
-
     if '#' in cleaned:
         cleaned = cleaned.split('#')[0]
-
     if not re.match(r'https?://.+\..+', cleaned):
         return ""
-
     return cleaned
 
 
 # ─────────────────────────────────────────────
-# Extract title and date from context around URL
+# Extract metadata (title + date) from context
 # ─────────────────────────────────────────────
 def extract_metadata_from_context(body, url, match_start):
-    """
-    Given a URL found at position match_start in body,
-    search the surrounding HTML to find:
-    - Title: link text, nearby heading, title attribute
-    - Date: nearby date string
-
-    Returns: (title, date)
-    """
     title = ""
     date = ""
 
-    # Get a window of text around the match
     window_start = max(0, match_start - 1000)
     window_end = min(len(body), match_start + len(url) + 1000)
     context = body[window_start:window_end]
 
-    escaped_url = re.escape(url)
-    # Also try partial match (last part of URL)
     url_tail = url.split('/')[-1] if '/' in url else url
     escaped_tail = re.escape(url_tail)
 
-    # ── TITLE EXTRACTION ──
+    # ── TITLE ──
 
     # Method 1: <a href="URL">TITLE</a>
-    patterns_title = [
-        # Full URL in href
-        r'<a[^>]*href\s*=\s*["\'][^"\']*'
-        + escaped_tail
-        + r'[^"\']*["\'][^>]*>\s*(.*?)\s*</a>',
-        # Any anchor with this URL, get text
-        r'href\s*=\s*["\'][^"\']*'
-        + escaped_tail
-        + r'[^"\']*["\'][^>]*>\s*([^<]+)',
-    ]
-
-    for pattern in patterns_title:
+    for pattern in [
+        r'<a[^>]*href\s*=\s*["\'][^"\']*' + escaped_tail +
+        r'[^"\']*["\'][^>]*>\s*(.*?)\s*</a>',
+        r'href\s*=\s*["\'][^"\']*' + escaped_tail +
+        r'[^"\']*["\'][^>]*>\s*([^<]+)',
+    ]:
         try:
-            match = re.search(pattern, context, re.IGNORECASE | re.DOTALL)
-            if match:
-                raw_title = match.group(1).strip()
-                # Clean HTML from title
-                raw_title = re.sub(r'<[^>]+>', ' ', raw_title)
-                raw_title = re.sub(r'\s+', ' ', raw_title).strip()
-                if raw_title and len(raw_title) > 2:
-                    title = raw_title
+            m = re.search(pattern, context, re.IGNORECASE | re.DOTALL)
+            if m:
+                raw = re.sub(r'<[^>]+>', ' ', m.group(1))
+                raw = re.sub(r'\s+', ' ', raw).strip()
+                if raw and len(raw) > 2:
+                    title = raw
                     break
         except re.error:
             pass
 
-    # Method 2: title="..." attribute on the link
+    # Method 2: title attribute
     if not title:
         try:
             pattern = (
-                r'<a[^>]*href\s*=\s*["\'][^"\']*'
-                + escaped_tail
-                + r'[^"\']*["\'][^>]*title\s*=\s*["\']([^"\']+)["\']'
+                r'<a[^>]*href\s*=\s*["\'][^"\']*' + escaped_tail +
+                r'[^"\']*["\'][^>]*title\s*=\s*["\']([^"\']+)["\']'
             )
-            match = re.search(pattern, context, re.IGNORECASE)
-            if match:
-                title = match.group(1).strip()
+            m = re.search(pattern, context, re.IGNORECASE)
+            if m:
+                title = m.group(1).strip()
         except re.error:
             pass
 
-    # Method 3: Nearby heading or strong text
+    # Method 3: Nearby heading
     if not title:
         try:
-            # Look for headings near the URL
-            pattern = (
-                r'<(?:h[1-6]|strong|b)[^>]*>\s*([^<]+?)\s*'
-                r'</(?:h[1-6]|strong|b)>'
+            matches = re.findall(
+                r'<(?:h[1-6]|strong|b)[^>]*>\s*([^<]+?)\s*</(?:h[1-6]|strong|b)>',
+                context, re.IGNORECASE
             )
-            matches = re.findall(pattern, context, re.IGNORECASE)
-            for m in matches:
-                m = m.strip()
-                if m and len(m) > 3 and len(m) < 200:
-                    title = m
+            for mt in matches:
+                mt = mt.strip()
+                if mt and 3 < len(mt) < 200:
+                    title = mt
                     break
         except re.error:
             pass
 
-    # Method 4: Nearby div/span with title-like class
+    # Method 4: Title-like class
     if not title:
         try:
-            pattern = (
+            matches = re.findall(
                 r'<(?:div|span)[^>]*class\s*=\s*["\'][^"\']*'
                 r'(?:title|name|heading|label)[^"\']*["\'][^>]*>'
-                r'\s*([^<]+?)\s*</(?:div|span)>'
+                r'\s*([^<]+?)\s*</(?:div|span)>',
+                context, re.IGNORECASE
             )
-            matches = re.findall(pattern, context, re.IGNORECASE)
-            for m in matches:
-                m = m.strip()
-                if m and len(m) > 3 and len(m) < 200:
-                    title = m
+            for mt in matches:
+                mt = mt.strip()
+                if mt and 3 < len(mt) < 200:
+                    title = mt
                     break
         except re.error:
             pass
 
-    # Method 5: Use BeautifulSoup on context
+    # Method 5: BeautifulSoup on context
     if not title:
         try:
             soup = BeautifulSoup(context, 'html.parser')
-
-            # Find the <a> tag with our URL
             for a_tag in soup.find_all('a', href=True):
                 href = a_tag.get('href', '')
                 if url_tail in href or url in href:
-                    # Get link text
-                    link_text = a_tag.get_text(strip=True)
-                    if link_text and len(link_text) > 2:
-                        title = link_text
+                    lt = a_tag.get_text(strip=True)
+                    if lt and len(lt) > 2:
+                        title = lt
                         break
-
-                    # Check title attribute
                     t = a_tag.get('title', '').strip()
                     if t:
                         title = t
                         break
-
-            # If still no title, check parent elements
             if not title:
                 for a_tag in soup.find_all('a', href=True):
                     href = a_tag.get('href', '')
                     if url_tail in href or url in href:
                         parent = a_tag.parent
                         while parent and parent.name:
-                            # Check siblings for title text
-                            for sibling in parent.children:
-                                if sibling == a_tag:
+                            for sib in parent.children:
+                                if sib == a_tag:
                                     continue
-                                if hasattr(sibling, 'get_text'):
-                                    sib_text = sibling.get_text(strip=True)
-                                    if (sib_text
-                                            and len(sib_text) > 3
-                                            and len(sib_text) < 200
-                                            and not sib_text.startswith('http')):
-                                        title = sib_text
+                                if hasattr(sib, 'get_text'):
+                                    st2 = sib.get_text(strip=True)
+                                    if (st2 and 3 < len(st2) < 200
+                                            and not st2.startswith('http')):
+                                        title = st2
                                         break
                             if title:
                                 break
                             parent = parent.parent
-                            # Don't go too far up
                             if parent and parent.name in [
                                 'body', 'html', 'main', 'section'
                             ]:
@@ -288,138 +230,94 @@ def extract_metadata_from_context(body, url, match_start):
         except Exception:
             pass
 
-    # ── DATE EXTRACTION ──
+    # ── DATE ──
 
-    # Method 1: Date from nearby HTML
     date_matches = DATE_REGEX.findall(context)
     if date_matches:
-        # Pick the closest date to the URL position
-        # (dates found in the context window)
         date = date_matches[0].strip()
 
-    # Method 2: Date from specific HTML elements
     if not date:
         try:
-            date_patterns_html = [
+            for pattern in [
                 r'<(?:time|span|div)[^>]*(?:class|datetime)\s*=\s*["\'][^"\']*'
                 r'(?:date|time|published|posted)[^"\']*["\'][^>]*>\s*([^<]+)',
                 r'<time[^>]*datetime\s*=\s*["\']([^"\']+)["\']',
                 r'<(?:span|div)[^>]*class\s*=\s*["\'][^"\']*date[^"\']*["\'][^>]*>\s*([^<]+)',
-            ]
-            for pattern in date_patterns_html:
-                match = re.search(pattern, context, re.IGNORECASE)
-                if match:
-                    d = match.group(1).strip()
+            ]:
+                m = re.search(pattern, context, re.IGNORECASE)
+                if m:
+                    d = m.group(1).strip()
                     if d and len(d) < 50:
                         date = d
                         break
         except re.error:
             pass
 
-    # Method 3: Date from BeautifulSoup
     if not date:
         try:
             soup = BeautifulSoup(context, 'html.parser')
-
-            # <time> tags
-            for time_tag in soup.find_all('time'):
-                dt = time_tag.get('datetime', '')
+            for tt in soup.find_all('time'):
+                dt = tt.get('datetime', '')
                 if dt:
                     date = dt.strip()
                     break
-                t = time_tag.get_text(strip=True)
+                t = tt.get_text(strip=True)
                 if t:
                     date = t
                     break
-
-            # Elements with date-related classes
             if not date:
                 for tag in soup.find_all(
-                    class_=re.compile(
-                        r'date|time|publish|posted|created',
-                        re.IGNORECASE
-                    )
+                    class_=re.compile(r'date|time|publish|posted', re.IGNORECASE)
                 ):
                     t = tag.get_text(strip=True)
-                    if t and len(t) < 50:
-                        # Verify it looks like a date
-                        if DATE_REGEX.search(t):
-                            date = t
-                            break
+                    if t and len(t) < 50 and DATE_REGEX.search(t):
+                        date = t
+                        break
         except Exception:
             pass
 
-    # Method 4: Date from JSON context
     if not date:
-        json_date_patterns = [
-            r'"(?:date|published|created|updated|timestamp|'
-            r'publishDate|createdAt|updatedAt|postDate|'
-            r'release_date|publish_date|filing_date)"\s*:\s*'
-            r'"([^"]+)"',
-        ]
-        for pattern in json_date_patterns:
+        for pattern in [
+            r'"(?:date|published|created|updated|timestamp|publishDate|'
+            r'createdAt|updatedAt|release_date|publish_date|filing_date)"\s*:\s*"([^"]+)"',
+        ]:
             try:
-                match = re.search(pattern, context, re.IGNORECASE)
-                if match:
-                    date = match.group(1).strip()
+                m = re.search(pattern, context, re.IGNORECASE)
+                if m:
+                    date = m.group(1).strip()
                     break
             except re.error:
                 pass
 
-    # Method 5: Date from URL itself
     if not date:
-        # URLs like /2025/01/ or /2025-01/
-        url_date = re.search(
-            r'/(\d{4})[/-](\d{2})(?:[/-](\d{2}))?/',
-            url
-        )
-        if url_date:
-            y, m = url_date.group(1), url_date.group(2)
-            d_part = url_date.group(3)
-            if d_part:
-                date = f"{y}-{m}-{d_part}"
-            else:
-                date = f"{y}-{m}"
+        ud = re.search(r'/(\d{4})[/-](\d{2})(?:[/-](\d{2}))?/', url)
+        if ud:
+            y, mo = ud.group(1), ud.group(2)
+            da = ud.group(3)
+            date = f"{y}-{mo}-{da}" if da else f"{y}-{mo}"
 
-    # Method 6: Date from filename
     if not date:
         fname = url.split('/')[-1]
-        # Patterns like Report-March2024.pdf
-        fname_date = re.search(
-            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)'
-            r'[a-z]*[-_]?\d{4}',
+        fd = re.search(
+            r'(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[-_]?\d{4}',
             fname, re.IGNORECASE
         )
-        if fname_date:
-            date = fname_date.group(0)
-
+        if fd:
+            date = fd.group(0)
         if not date:
-            # Patterns like 20240315 or 2024-03-15 in filename
-            fname_date2 = re.search(
-                r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})',
-                fname
-            )
-            if fname_date2:
-                y = fname_date2.group(1)
-                m = fname_date2.group(2)
-                d_val = fname_date2.group(3)
-                if 2000 <= int(y) <= 2030:
-                    date = f"{y}-{m}-{d_val}"
+            fd2 = re.search(r'(\d{4})[-_]?(\d{2})[-_]?(\d{2})', fname)
+            if fd2 and 2000 <= int(fd2.group(1)) <= 2030:
+                date = f"{fd2.group(1)}-{fd2.group(2)}-{fd2.group(3)}"
 
-    # Clean up title
     if title:
         title = re.sub(r'<[^>]+>', '', title)
-        title = re.sub(r'\s+', ' ', title).strip()
-        title = title.strip('|/-:. ')
+        title = re.sub(r'\s+', ' ', title).strip().strip('|/-:. ')
         if len(title) > 150:
             title = title[:147] + "..."
 
-    # Clean up date
     if date:
         date = date.strip('|/-:,. ')
-        # Remove time portion if present
-        date = re.sub(r'T\d{2}:\d{2}.*$', '', date)
-        date = date.strip()
+        date = re.sub(r'T\d{2}:\d{2}.*$', '', date).strip()
 
     return title, date
 
@@ -431,24 +329,19 @@ def extract_urls_from_html(html_string, base_url=""):
     urls = set()
     if not html_string or len(html_string) < 10:
         return urls
-
     try:
         soup = BeautifulSoup(html_string, 'html.parser')
     except Exception:
         return urls
 
-    url_attrs = [
-        'href', 'src', 'data-href', 'data-src',
-        'data-url', 'data-file', 'data-download',
-        'data-pdf', 'data-link', 'action', 'content',
-    ]
-
-    for attr in url_attrs:
+    for attr in [
+        'href', 'src', 'data-href', 'data-src', 'data-url',
+        'data-file', 'data-download', 'data-pdf', 'data-link',
+        'action', 'content',
+    ]:
         for tag in soup.find_all(attrs={attr: True}):
             val = tag.get(attr, '').strip()
-            if val and not val.startswith(
-                ('#', 'javascript:', 'mailto:')
-            ):
+            if val and not val.startswith(('#', 'javascript:', 'mailto:')):
                 if val.startswith('http'):
                     urls.add(val)
                 elif val.startswith('//'):
@@ -458,18 +351,12 @@ def extract_urls_from_html(html_string, base_url=""):
 
     for tag in soup.find_all(True):
         if tag.string:
-            found = re.findall(
-                r'https?://[^\s<>"\']+', tag.string
-            )
-            urls.update(found)
+            urls.update(re.findall(r'https?://[^\s<>"\']+', tag.string))
 
     for attr in ['onclick', 'onmousedown']:
         for tag in soup.find_all(attrs={attr: True}):
             val = tag.get(attr, '')
-            found = re.findall(
-                r'["\']?(https?://[^\s"\'<>)]+)', val
-            )
-            urls.update(found)
+            urls.update(re.findall(r'["\']?(https?://[^\s"\'<>)]+)', val))
 
     return urls
 
@@ -480,7 +367,6 @@ def extract_urls_from_html(html_string, base_url=""):
 def parse_har_bodies(har_content):
     bodies = []
     log = []
-
     try:
         har_data = json.loads(har_content)
     except json.JSONDecodeError as e:
@@ -495,30 +381,22 @@ def parse_har_bodies(har_content):
     log.append(f"HAR file has {len(entries)} entries")
 
     for entry in entries:
-        request = entry.get('request', {})
-        response = entry.get('response', {})
-        req_url = request.get('url', '')
-        content = response.get('content', {})
+        req_url = entry.get('request', {}).get('url', '')
+        content = entry.get('response', {}).get('content', {})
         body = content.get('text', '')
-
         if not body or len(body) < 20:
             continue
-
         mime = content.get('mimeType', '').lower()
         unescaped = unescape_json_string(body)
         bodies.append((mime, req_url, unescaped))
 
-        if ('json' in mime
-                or unescaped.strip().startswith(('{', '['))):
+        if 'json' in mime or unescaped.strip().startswith(('{', '[')):
             try:
                 data = json.loads(unescaped)
                 for frag in extract_html_from_json(data):
-                    clean_frag = unescape_json_string(frag)
-                    if '<' in clean_frag and '>' in clean_frag:
-                        bodies.append((
-                            'text/html (from json)',
-                            req_url, clean_frag
-                        ))
+                    cf = unescape_json_string(frag)
+                    if '<' in cf and '>' in cf:
+                        bodies.append(('text/html (from json)', req_url, cf))
             except json.JSONDecodeError:
                 pass
 
@@ -547,9 +425,8 @@ def extract_html_from_json(data):
         if not value or len(value) < 20:
             return
         indicators = [
-            '<a ', '<a\n', '<div', '<span', '<td',
-            '<tr', '<table', '<p ', '<p>', '<li',
-            'href=', 'src=',
+            '<a ', '<a\n', '<div', '<span', '<td', '<tr',
+            '<table', '<p ', '<p>', '<li', 'href=', 'src=',
         ]
         vl = value.lower()
         if any(ind in vl for ind in indicators):
@@ -564,33 +441,26 @@ def extract_html_from_json(data):
 # ─────────────────────────────────────────────
 def find_urls_around_match(body, match_text, match_start):
     urls = set()
-    window_start = max(0, match_start - 500)
-    window_end = min(len(body), match_start + len(match_text) + 500)
-    context = body[window_start:window_end]
+    ws = max(0, match_start - 500)
+    we = min(len(body), match_start + len(match_text) + 500)
+    ctx = body[ws:we]
+    esc = re.escape(match_text)
 
-    escaped = re.escape(match_text)
-
-    href_patterns = [
-        r'href\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
-        r'src\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
-        r'data-url\s*=\s*["\']([^"\']*' + escaped + r'[^"\']*)["\']',
-    ]
-
-    for pattern in href_patterns:
+    for pat in [
+        r'href\s*=\s*["\']([^"\']*' + esc + r'[^"\']*)["\']',
+        r'src\s*=\s*["\']([^"\']*' + esc + r'[^"\']*)["\']',
+        r'data-url\s*=\s*["\']([^"\']*' + esc + r'[^"\']*)["\']',
+    ]:
         try:
-            found = re.findall(pattern, context, re.IGNORECASE)
-            urls.update(found)
+            urls.update(re.findall(pat, ctx, re.IGNORECASE))
         except re.error:
             pass
 
-    url_pattern = (
-        r'(https?://[^\s"\'<>]*'
-        + escaped
-        + r'[^\s"\'<>]*)'
-    )
     try:
-        found = re.findall(url_pattern, context, re.IGNORECASE)
-        urls.update(found)
+        urls.update(re.findall(
+            r'(https?://[^\s"\'<>]*' + esc + r'[^\s"\'<>]*)',
+            ctx, re.IGNORECASE
+        ))
     except re.error:
         pass
 
@@ -598,15 +468,11 @@ def find_urls_around_match(body, match_text, match_start):
 
 
 # ─────────────────────────────────────────────
-# Smart regex application with metadata
+# Smart regex with metadata
 # ─────────────────────────────────────────────
 def apply_smart_regex(bodies, pattern, exclude_keywords):
-    """
-    Returns: list of (url, matched_by, source_url, title, date)
-    """
     results = []
     seen = set()
-
     try:
         compiled = re.compile(pattern, re.IGNORECASE)
     except re.error as e:
@@ -618,69 +484,41 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
         '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
         '.ico', '.css', '.woff', '.woff2', '.ttf',
         '.mp4', '.mp3', '.webm',
-        'google-analytics', 'googletagmanager',
-        'doubleclick.net',
+        'google-analytics', 'googletagmanager', 'doubleclick.net',
     ]
     all_exc = exc_lower + auto_exc
 
     for mime, req_url, body in bodies:
         if not body:
             continue
-
         try:
-            p = urlparse(req_url)
-            base_url = f"{p.scheme}://{p.netloc}"
+            base_url = f"{urlparse(req_url).scheme}://{urlparse(req_url).netloc}"
         except Exception:
             base_url = ""
 
-        for match_obj in compiled.finditer(body):
-            if match_obj.lastindex and match_obj.lastindex >= 1:
-                matched_text = match_obj.group(1)
-            else:
-                matched_text = match_obj.group(0)
-
-            if not matched_text or len(matched_text) < 3:
+        for mo in compiled.finditer(body):
+            matched = mo.group(1) if mo.lastindex and mo.lastindex >= 1 else mo.group(0)
+            if not matched or len(matched) < 3:
                 continue
 
-            match_start = match_obj.start()
-
-            cleaned = clean_url(matched_text)
+            ms = mo.start()
+            cleaned = clean_url(matched)
 
             if cleaned:
-                if cleaned not in seen:
-                    if not any(e in cleaned.lower() for e in all_exc):
-                        seen.add(cleaned)
-                        title, date = extract_metadata_from_context(
-                            body, cleaned, match_start
-                        )
-                        results.append((
-                            cleaned, "regex-direct",
-                            req_url, title, date
-                        ))
+                if cleaned not in seen and not any(e in cleaned.lower() for e in all_exc):
+                    seen.add(cleaned)
+                    title, date = extract_metadata_from_context(body, cleaned, ms)
+                    results.append((cleaned, "regex-direct", req_url, title, date))
                 continue
 
-            surrounding = find_urls_around_match(
-                body, matched_text, match_start
-            )
-
-            for raw_url in surrounding:
-                c = clean_url(raw_url)
-                if not c:
-                    if raw_url.startswith('/') and base_url:
-                        c = base_url + raw_url
-                    else:
-                        continue
-
-                if c not in seen:
-                    if not any(e in c.lower() for e in all_exc):
-                        seen.add(c)
-                        title, date = extract_metadata_from_context(
-                            body, c, match_start
-                        )
-                        results.append((
-                            c, "regex-context",
-                            req_url, title, date
-                        ))
+            for raw in find_urls_around_match(body, matched, ms):
+                c = clean_url(raw)
+                if not c and raw.startswith('/') and base_url:
+                    c = base_url + raw
+                if c and c not in seen and not any(e in c.lower() for e in all_exc):
+                    seen.add(c)
+                    title, date = extract_metadata_from_context(body, c, ms)
+                    results.append((c, "regex-context", req_url, title, date))
 
     results.sort(key=lambda x: x[0].split('/')[-1].lower())
     return results
@@ -690,121 +528,89 @@ def apply_smart_regex(bodies, pattern, exclude_keywords):
 # Keyword filter with metadata
 # ─────────────────────────────────────────────
 def apply_keyword_filter(bodies, include_keywords, exclude_keywords):
-    """
-    Returns: list of (url, matched_by, source_url, title, date)
-    """
     results = []
     seen = set()
-
     inc = [kw.strip().lower() for kw in include_keywords if kw.strip()]
     exc = [kw.strip().lower() for kw in exclude_keywords if kw.strip()]
     auto_exc = [
         '.jpg', '.jpeg', '.png', '.gif', '.svg', '.webp',
         '.ico', '.css', '.woff', '.woff2', '.ttf',
         '.mp4', '.mp3', '.webm',
-        'google-analytics', 'googletagmanager',
-        'doubleclick.net',
+        'google-analytics', 'googletagmanager', 'doubleclick.net',
     ]
     all_exc = exc + auto_exc
 
     for mime, req_url, body in bodies:
         if not body:
             continue
-
         try:
-            p = urlparse(req_url)
-            base = f"{p.scheme}://{p.netloc}" if p.scheme else ""
+            base = f"{urlparse(req_url).scheme}://{urlparse(req_url).netloc}"
         except Exception:
             base = ""
 
         found_urls = set()
-
         if '<' in body and '>' in body:
             found_urls.update(extract_urls_from_html(body, base))
-
-        raw = re.findall(r'https?://[^\s"\'<>\\,;\]})]+', body)
-        found_urls.update(raw)
+        found_urls.update(re.findall(r'https?://[^\s"\'<>\\,;\]})]+', body))
 
         for raw_url in found_urls:
             cleaned = clean_url(raw_url)
             if not cleaned or cleaned in seen:
                 continue
-
             cl = cleaned.lower()
             if any(e in cl for e in all_exc):
                 continue
-
             matched = None
             for kw in inc:
                 if kw in cl:
                     matched = kw
                     break
-
             if matched:
                 seen.add(cleaned)
-                # Find position in body for context
                 pos = body.find(raw_url)
                 if pos == -1:
                     pos = body.find(cleaned)
                 if pos == -1:
                     pos = 0
-
-                title, date = extract_metadata_from_context(
-                    body, cleaned, pos
-                )
-                results.append((
-                    cleaned, f"keyword: {matched}",
-                    req_url, title, date
-                ))
+                title, date = extract_metadata_from_context(body, cleaned, pos)
+                results.append((cleaned, f"keyword: {matched}", req_url, title, date))
 
     results.sort(key=lambda x: x[0].split('/')[-1].lower())
     return results
 
 
 # ─────────────────────────────────────────────
-# Generate output files
+# Output generators
 # ─────────────────────────────────────────────
-def generate_html_links(results):
-    """
-    Generate <a href="URL">Title | Date</a> format.
-    One per line.
-    """
+def generate_html_links_txt(results):
     lines = []
     for item in results:
         url = item[0]
-        title = item[3] if len(item) > 3 else ""
-        date = item[4] if len(item) > 4 else ""
-
-        # Build display text
+        title = item[3] if len(item) > 3 and item[3] else ""
+        date = item[4] if len(item) > 4 and item[4] else ""
         fname = url.split('/')[-1].split('?')[0]
         if not fname:
             fname = url.split('/')[-2] if '/' in url else "link"
 
-        display_parts = []
+        parts = []
         if title:
-            display_parts.append(title)
+            parts.append(title)
         else:
-            # Use filename as fallback title
-            clean_fname = fname.replace('.pdf', '').replace('.xlsx', '')
-            clean_fname = clean_fname.replace('-', ' ').replace('_', ' ')
-            display_parts.append(clean_fname.strip() or fname)
-
+            cf = fname.replace('.pdf', '').replace('.xlsx', '')
+            cf = cf.replace('-', ' ').replace('_', ' ').strip()
+            parts.append(cf or fname)
         if date:
-            display_parts.append(date)
+            parts.append(date)
 
-        display_text = " | ".join(display_parts)
-
-        lines.append(f'<a href="{url}">{display_text}</a>')
-
+        display = " | ".join(parts)
+        lines.append(f'<a href="{url}">{display}</a>')
     return "\n".join(lines)
 
 
 def generate_full_report(results, source, inc_kw, exc_kw,
                          pdf_regex="", html_regex=""):
     lines = [
-        "=" * 70,
-        "URL EXTRACTION REPORT",
-        "=" * 70,
+        "=" * 70, "URL EXTRACTION REPORT", "=" * 70,
         f"Source       : {source}",
         f"Date         : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Total URLs   : {len(results)}",
@@ -816,55 +622,418 @@ def generate_full_report(results, source, inc_kw, exc_kw,
     if html_regex:
         lines.append(f"HTML Regex   : {html_regex}")
     lines.append(f"Excludes     : {len(exc_kw)} patterns")
-
-    lines.extend(["=" * 70, ""])
-    lines.append("── HTML LINKS WITH TITLES & DATES ──")
-    lines.append("")
+    lines.extend(["=" * 70, "", "── HTML LINKS WITH TITLES & DATES ──", ""])
 
     for i, item in enumerate(results, 1):
         url = item[0]
-        matched_by = item[1]
-        title = item[3] if len(item) > 3 else ""
-        date = item[4] if len(item) > 4 else ""
-
-        fname = url.split('/')[-1].split('?')[0]
-        if not fname:
-            fname = "link"
-
-        display_parts = []
-        if title:
-            display_parts.append(title)
-        else:
-            display_parts.append(fname)
+        mb = item[1]
+        title = item[3] if len(item) > 3 and item[3] else ""
+        date = item[4] if len(item) > 4 and item[4] else ""
+        fname = url.split('/')[-1].split('?')[0] or "link"
+        parts = []
+        parts.append(title if title else fname)
         if date:
-            display_parts.append(date)
-
-        display = " | ".join(display_parts)
-
+            parts.append(date)
+        display = " | ".join(parts)
         lines.append(f'{i:4d}. <a href="{url}">{display}</a>')
         lines.append(f"      Title: {title or '(from filename)'}")
         lines.append(f"      Date:  {date or '(not found)'}")
-        lines.append(f"      Match: {matched_by}")
+        lines.append(f"      Match: {mb}")
         lines.append("")
 
-    lines.extend(["=" * 70, ""])
-    lines.append("── PLAIN URL LIST ──")
-    lines.append("")
+    lines.extend(["=" * 70, "", "── PLAIN URL LIST ──", ""])
     for item in results:
         lines.append(item[0])
-
     lines.extend(["", "=" * 70, "END"])
     return "\n".join(lines)
 
 
+def generate_html_file(results, source="", inc_kw=None,
+                       pdf_regex="", html_regex=""):
+    total = len(results)
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    kw_str = ', '.join(inc_kw) if inc_kw else 'None'
+
+    rows_html = ""
+    for i, item in enumerate(results, 1):
+        url = item[0]
+        title = item[3] if len(item) > 3 and item[3] else ""
+        date = item[4] if len(item) > 4 and item[4] else ""
+        matched_by = item[1]
+        fname = url.split('/')[-1].split('?')[0]
+        if not fname:
+            fname = url.split('/')[-2] if '/' in url else "link"
+
+        display_title = title if title else fname
+        display_title = (
+            display_title.replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;')
+        )
+        escaped_url = url.replace('&', '&amp;').replace('"', '&quot;')
+        safe_url_js = url.replace("'", "\\'").replace('"', '\\"')
+        date_display = date or '—'
+        mb_display = (
+            matched_by.replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;')
+        )
+
+        rows_html += f"""
+        <tr>
+            <td class="num">{i}</td>
+            <td class="title">{display_title}</td>
+            <td class="date">{date_display}</td>
+            <td class="link">
+                <a href="{escaped_url}" target="_blank"
+                   rel="noopener noreferrer">{fname}</a>
+            </td>
+            <td class="matched">{mb_display}</td>
+            <td class="actions">
+                <button onclick="copyUrl('{safe_url_js}')"
+                        title="Copy URL">📋</button>
+            </td>
+        </tr>"""
+
+    all_href_lines = ""
+    for item in results:
+        url = item[0]
+        title = item[3] if len(item) > 3 and item[3] else ""
+        date = item[4] if len(item) > 4 and item[4] else ""
+        fname = url.split('/')[-1].split('?')[0] or "link"
+        display = title if title else fname
+        if date:
+            display += f" | {date}"
+        escaped_url = url.replace('&', '&amp;').replace('"', '&quot;')
+        display = (
+            display.replace('&', '&amp;')
+            .replace('<', '&lt;').replace('>', '&gt;')
+            .replace('"', '&quot;')
+        )
+        all_href_lines += (
+            f'&lt;a href="{escaped_url}"&gt;{display}&lt;/a&gt;\n'
+        )
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Extracted URLs — {now}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont,
+                         'Segoe UI', Roboto, sans-serif;
+            background: #f5f7fa; color: #333; padding: 20px;
+        }}
+        .container {{ max-width: 1400px; margin: 0 auto; }}
+        header {{
+            background: linear-gradient(135deg, #1a73e8, #0d47a1);
+            color: white; padding: 24px 32px;
+            border-radius: 12px; margin-bottom: 20px;
+        }}
+        header h1 {{ font-size: 24px; margin-bottom: 8px; }}
+        header .meta {{
+            font-size: 13px; opacity: 0.85;
+            display: flex; flex-wrap: wrap; gap: 16px;
+        }}
+        .controls {{
+            display: flex; gap: 10px; margin-bottom: 16px;
+            flex-wrap: wrap; align-items: center;
+        }}
+        .search-box {{
+            flex: 1; min-width: 250px; padding: 10px 16px;
+            border: 2px solid #ddd; border-radius: 8px;
+            font-size: 14px; outline: none;
+        }}
+        .search-box:focus {{ border-color: #1a73e8; }}
+        .btn {{
+            padding: 10px 18px; border: none; border-radius: 8px;
+            cursor: pointer; font-size: 13px; font-weight: 500;
+            transition: all 0.2s; white-space: nowrap;
+        }}
+        .btn-primary {{ background: #1a73e8; color: white; }}
+        .btn-primary:hover {{ background: #1557b0; }}
+        .btn-secondary {{ background: #e8eaed; color: #333; }}
+        .btn-secondary:hover {{ background: #d2d5da; }}
+        .btn-success {{ background: #0d904f; color: white; }}
+        .btn-success:hover {{ background: #0a7a42; }}
+        .count-badge {{
+            background: #e8f0fe; color: #1a73e8;
+            padding: 8px 16px; border-radius: 8px;
+            font-weight: 600; font-size: 14px;
+        }}
+        .table-wrapper {{
+            background: white; border-radius: 12px;
+            overflow-x: auto;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        thead th {{
+            background: #f8f9fa; padding: 12px 14px;
+            text-align: left; font-size: 11px;
+            text-transform: uppercase; letter-spacing: 0.5px;
+            color: #666; border-bottom: 2px solid #e8eaed;
+            cursor: pointer; user-select: none; white-space: nowrap;
+        }}
+        thead th:hover {{ background: #e8eaed; }}
+        thead th .sort-icon {{ margin-left: 4px; opacity: 0.4; }}
+        tbody td {{
+            padding: 10px 14px; border-bottom: 1px solid #f0f0f0;
+            font-size: 13px; vertical-align: middle;
+        }}
+        tbody tr:hover {{ background: #f8f9fa; }}
+        tbody tr.hidden {{ display: none; }}
+        .num {{ width: 40px; color: #999; text-align: center; }}
+        .title {{ max-width: 300px; word-break: break-word; }}
+        .date {{ white-space: nowrap; color: #555; min-width: 100px; font-weight: 500; }}
+        .link {{ max-width: 350px; word-break: break-all; }}
+        .link a {{
+            color: #1a73e8; text-decoration: none; font-size: 12px;
+        }}
+        .link a:hover {{ text-decoration: underline; }}
+        .matched {{ font-size: 11px; color: #888; max-width: 120px; }}
+        .actions {{ width: 50px; text-align: center; }}
+        .actions button {{
+            background: none; border: 1px solid #ddd;
+            border-radius: 4px; cursor: pointer;
+            padding: 4px 8px; font-size: 14px;
+        }}
+        .actions button:hover {{
+            background: #e8f0fe; border-color: #1a73e8;
+        }}
+        .toast {{
+            position: fixed; bottom: 20px; right: 20px;
+            background: #333; color: white; padding: 12px 24px;
+            border-radius: 8px; font-size: 14px;
+            opacity: 0; transition: opacity 0.3s; z-index: 1000;
+        }}
+        .toast.show {{ opacity: 1; }}
+        .href-section {{
+            margin-top: 24px; background: white;
+            border-radius: 12px; padding: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }}
+        .href-section h3 {{ margin-bottom: 12px; color: #333; }}
+        .href-box {{
+            background: #f8f9fa; border: 1px solid #e8eaed;
+            border-radius: 8px; padding: 16px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px; line-height: 1.8;
+            max-height: 400px; overflow-y: auto;
+            white-space: pre-wrap; word-break: break-all;
+        }}
+        .stats {{
+            display: flex; gap: 16px; margin-bottom: 16px;
+            flex-wrap: wrap;
+        }}
+        .stat-card {{
+            background: white; border-radius: 8px;
+            padding: 16px 24px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+            text-align: center; min-width: 120px;
+        }}
+        .stat-card .number {{
+            font-size: 28px; font-weight: 700; color: #1a73e8;
+        }}
+        .stat-card .label {{
+            font-size: 11px; color: #888;
+            text-transform: uppercase; letter-spacing: 0.5px;
+        }}
+        @media (max-width: 768px) {{
+            .controls {{ flex-direction: column; }}
+            .search-box {{ min-width: 100%; }}
+            .stats {{ flex-direction: column; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📄 Extracted URLs</h1>
+            <div class="meta">
+                <span>📁 {source}</span>
+                <span>📅 {now}</span>
+                <span>🔗 {total} URLs</span>
+                <span>🔑 {kw_str}</span>
+                {'<span>📄 ' + pdf_regex + '</span>' if pdf_regex else ''}
+                {'<span>🌐 ' + html_regex + '</span>' if html_regex else ''}
+            </div>
+        </header>
+
+        <div class="stats">
+            <div class="stat-card">
+                <div class="number">{total}</div>
+                <div class="label">Total Links</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{len([r for r in results if r[4] if len(r) > 4])}</div>
+                <div class="label">With Dates</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{len([r for r in results if r[3] if len(r) > 3])}</div>
+                <div class="label">With Titles</div>
+            </div>
+            <div class="stat-card">
+                <div class="number">{len([r for r in results if '.pdf' in r[0].lower()])}</div>
+                <div class="label">PDF Files</div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <input type="text" class="search-box" id="searchBox"
+                   placeholder="🔍 Search titles, dates, URLs..."
+                   oninput="filterTable()">
+            <span class="count-badge" id="countBadge">{total} links</span>
+            <button class="btn btn-primary" onclick="copyAllHrefs()">
+                📋 Copy &lt;a href&gt; Tags
+            </button>
+            <button class="btn btn-success" onclick="copyAllUrls()">
+                🔗 Copy URLs
+            </button>
+            <button class="btn btn-secondary" onclick="exportVisible()">
+                💾 Export Visible
+            </button>
+        </div>
+
+        <div class="table-wrapper">
+            <table id="urlTable">
+                <thead>
+                    <tr>
+                        <th onclick="sortTable(0)"># <span class="sort-icon">↕</span></th>
+                        <th onclick="sortTable(1)">Title <span class="sort-icon">↕</span></th>
+                        <th onclick="sortTable(2)">Date <span class="sort-icon">↕</span></th>
+                        <th onclick="sortTable(3)">Link <span class="sort-icon">↕</span></th>
+                        <th onclick="sortTable(4)">Source <span class="sort-icon">↕</span></th>
+                        <th>Copy</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody">{rows_html}</tbody>
+            </table>
+        </div>
+
+        <div class="href-section">
+            <h3>📋 All Links as &lt;a href&gt; Tags</h3>
+            <div style="margin-bottom:12px; display:flex; gap:8px;">
+                <button class="btn btn-primary" onclick="copyHrefBox()">
+                    Copy All
+                </button>
+                <button class="btn btn-secondary" onclick="downloadHrefTxt()">
+                    💾 Save as .txt
+                </button>
+            </div>
+            <div class="href-box" id="hrefBox">{all_href_lines}</div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast">Copied!</div>
+
+    <script>
+        function showToast(msg) {{
+            const t = document.getElementById('toast');
+            t.textContent = msg || 'Copied!';
+            t.classList.add('show');
+            setTimeout(() => t.classList.remove('show'), 2000);
+        }}
+
+        function copyUrl(url) {{
+            navigator.clipboard.writeText(url)
+                .then(() => showToast('URL copied!'));
+        }}
+
+        function copyAllHrefs() {{
+            const box = document.getElementById('hrefBox');
+            navigator.clipboard.writeText(box.textContent)
+                .then(() => showToast('All <a href> tags copied!'));
+        }}
+
+        function copyAllUrls() {{
+            const rows = document.querySelectorAll('#tableBody tr:not(.hidden)');
+            const urls = [];
+            rows.forEach(r => {{
+                const a = r.querySelector('.link a');
+                if (a) urls.push(a.href);
+            }});
+            navigator.clipboard.writeText(urls.join('\\n'))
+                .then(() => showToast(urls.length + ' URLs copied!'));
+        }}
+
+        function copyHrefBox() {{
+            const box = document.getElementById('hrefBox');
+            navigator.clipboard.writeText(box.textContent)
+                .then(() => showToast('Copied!'));
+        }}
+
+        function filterTable() {{
+            const q = document.getElementById('searchBox').value.toLowerCase();
+            const rows = document.querySelectorAll('#tableBody tr');
+            let vis = 0;
+            rows.forEach(r => {{
+                if (r.textContent.toLowerCase().includes(q)) {{
+                    r.classList.remove('hidden'); vis++;
+                }} else {{
+                    r.classList.add('hidden');
+                }}
+            }});
+            document.getElementById('countBadge').textContent = vis + ' links';
+        }}
+
+        let sortDir = {{}};
+        function sortTable(col) {{
+            const tbody = document.getElementById('tableBody');
+            const rows = Array.from(tbody.querySelectorAll('tr'));
+            sortDir[col] = !sortDir[col];
+            const dir = sortDir[col] ? 1 : -1;
+            rows.sort((a, b) => {{
+                let av = a.cells[col].textContent.trim();
+                let bv = b.cells[col].textContent.trim();
+                if (col === 0) return (parseInt(av) - parseInt(bv)) * dir;
+                return av.localeCompare(bv) * dir;
+            }});
+            rows.forEach(r => tbody.appendChild(r));
+        }}
+
+        function exportVisible() {{
+            const rows = document.querySelectorAll('#tableBody tr:not(.hidden)');
+            let text = '';
+            rows.forEach(r => {{
+                const title = r.querySelector('.title').textContent.trim();
+                const date = r.querySelector('.date').textContent.trim();
+                const a = r.querySelector('.link a');
+                const url = a ? a.href : '';
+                const display = title + (date !== '—' ? ' | ' + date : '');
+                text += '<a href="' + url + '">' + display + '</a>\\n';
+            }});
+            const blob = new Blob([text], {{type: 'text/plain'}});
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'exported_links.txt';
+            a.click();
+            showToast('Exported!');
+        }}
+
+        function downloadHrefTxt() {{
+            const box = document.getElementById('hrefBox');
+            const blob = new Blob([box.textContent], {{type: 'text/plain'}});
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = 'href_links.txt';
+            a.click();
+            showToast('Downloaded!');
+        }}
+    </script>
+</body>
+</html>"""
+    return html_content
+
+
 # ═════════════════════════════════════════════
-# UI
+# STREAMLIT UI
 # ═════════════════════════════════════════════
 
 st.title("📄 HAR → URL Extractor")
 st.markdown(
     "Upload `.har` → Extract URLs with **titles & dates** "
-    "→ Download as `<a href>` format"
+    "→ Download as `.txt` and `.html`"
 )
 
 with st.expander("📖 How to capture .har file"):
@@ -887,10 +1056,8 @@ kw1, kw2 = st.columns(2)
 with kw1:
     st.markdown("**✅ Include Keywords** (URL must contain ≥1)")
     include_input = st.text_input(
-        "Keywords (| separated)",
-        value=".pdf",
-        placeholder=".pdf|/download/|.xlsx",
-        key="inc"
+        "Keywords (| separated)", value=".pdf",
+        placeholder=".pdf|/download/|.xlsx", key="inc"
     )
 with kw2:
     st.markdown("**❌ Exclude Keywords**")
@@ -903,8 +1070,8 @@ with kw2:
 st.markdown("---")
 st.subheader("🔍 Regex Patterns (Smart)")
 st.caption(
-    "Type a simple keyword OR a full regex. "
-    "The app finds the URL automatically."
+    "Type simple text OR full regex. "
+    "App finds the URL automatically."
 )
 
 rx1, rx2 = st.columns(2)
@@ -912,23 +1079,17 @@ with rx1:
     st.markdown("**📄 PDF / Document Regex**")
     pdf_regex = st.text_input(
         "PDF regex", value="",
-        placeholder=r'\.pdf|annual-report',
-        key="pdf_rx"
+        placeholder=r'\.pdf|annual-report', key="pdf_rx"
     )
 with rx2:
     st.markdown("**🌐 HTML / Page Link Regex**")
     html_regex = st.text_input(
         "HTML regex", value="",
-        placeholder="communique-de-presse",
-        key="html_rx"
+        placeholder="communique-de-presse", key="html_rx"
     )
 
-include_keywords = [
-    kw.strip() for kw in include_input.split('|') if kw.strip()
-]
-exclude_keywords = [
-    kw.strip() for kw in exclude_input.split('|') if kw.strip()
-]
+include_keywords = [kw.strip() for kw in include_input.split('|') if kw.strip()]
+exclude_keywords = [kw.strip() for kw in exclude_input.split('|') if kw.strip()]
 
 parts = []
 if include_keywords:
@@ -938,8 +1099,8 @@ if pdf_regex.strip():
 if html_regex.strip():
     parts.append(f"HTML regex: `{html_regex.strip()}`")
 st.info(
-    f"**Active:** {' | '.join(parts)}" if parts else
-    "**⚠️ No filters set**"
+    f"**Active:** {' | '.join(parts)}" if parts
+    else "**⚠️ No filters set**"
 )
 
 # ─── Extract ───
@@ -949,15 +1110,12 @@ if uploaded_file:
     try:
         har_content = uploaded_file.read().decode('utf-8')
     except UnicodeDecodeError:
-        har_content = uploaded_file.read().decode(
-            'utf-8', errors='ignore'
-        )
+        har_content = uploaded_file.read().decode('utf-8', errors='ignore')
 
     file_mb = len(har_content) / (1024 * 1024)
     st.caption(f"📁 {uploaded_file.name} | {file_mb:.1f} MB")
 
     if st.button("🚀 Extract URLs", type="primary", key="go"):
-
         with st.spinner("Parsing HAR file..."):
             bodies, parse_log = parse_har_bodies(har_content)
             st.session_state.body_texts = bodies
@@ -968,53 +1126,36 @@ if uploaded_file:
 
         if include_keywords:
             with st.spinner(f"Keywords: {include_keywords}..."):
-                for item in apply_keyword_filter(
-                    bodies, include_keywords, exclude_keywords
-                ):
+                for item in apply_keyword_filter(bodies, include_keywords, exclude_keywords):
                     if item[0] not in seen:
                         seen.add(item[0])
                         all_results.append(item)
 
         if pdf_regex.strip():
             with st.spinner(f"PDF regex: {pdf_regex}..."):
-                for item in apply_smart_regex(
-                    bodies, pdf_regex.strip(), exclude_keywords
-                ):
+                for item in apply_smart_regex(bodies, pdf_regex.strip(), exclude_keywords):
                     if item[0] not in seen:
                         seen.add(item[0])
-                        all_results.append((
-                            item[0], f"pdf-{item[1]}",
-                            item[2], item[3], item[4]
-                        ))
+                        all_results.append((item[0], f"pdf-{item[1]}", item[2], item[3], item[4]))
 
         if html_regex.strip():
             with st.spinner(f"HTML regex: {html_regex}..."):
-                for item in apply_smart_regex(
-                    bodies, html_regex.strip(), exclude_keywords
-                ):
+                for item in apply_smart_regex(bodies, html_regex.strip(), exclude_keywords):
                     if item[0] not in seen:
                         seen.add(item[0])
-                        all_results.append((
-                            item[0], f"html-{item[1]}",
-                            item[2], item[3], item[4]
-                        ))
+                        all_results.append((item[0], f"html-{item[1]}", item[2], item[3], item[4]))
 
-        all_results.sort(
-            key=lambda x: x[0].split('/')[-1].lower()
-        )
+        all_results.sort(key=lambda x: x[0].split('/')[-1].lower())
         st.session_state.filtered_links = all_results
         st.session_state.har_loaded = True
 
         m1, m2, m3, m4 = st.columns(4)
         with m1:
-            st.metric("🔑 Keyword",
-                       len([r for r in all_results if 'keyword' in r[1]]))
+            st.metric("🔑 Keyword", len([r for r in all_results if 'keyword' in r[1]]))
         with m2:
-            st.metric("📄 PDF Regex",
-                       len([r for r in all_results if 'pdf' in r[1]]))
+            st.metric("📄 PDF Regex", len([r for r in all_results if 'pdf' in r[1]]))
         with m3:
-            st.metric("🌐 HTML Regex",
-                       len([r for r in all_results if 'html' in r[1]]))
+            st.metric("🌐 HTML Regex", len([r for r in all_results if 'html' in r[1]]))
         with m4:
             st.metric("📊 Total", len(all_results))
 
@@ -1029,60 +1170,41 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
         bodies = st.session_state.body_texts
         all_results = []
         seen = set()
-
         if include_keywords:
-            for item in apply_keyword_filter(
-                bodies, include_keywords, exclude_keywords
-            ):
+            for item in apply_keyword_filter(bodies, include_keywords, exclude_keywords):
                 if item[0] not in seen:
                     seen.add(item[0])
                     all_results.append(item)
         if pdf_regex.strip():
-            for item in apply_smart_regex(
-                bodies, pdf_regex.strip(), exclude_keywords
-            ):
+            for item in apply_smart_regex(bodies, pdf_regex.strip(), exclude_keywords):
                 if item[0] not in seen:
                     seen.add(item[0])
-                    all_results.append((
-                        item[0], f"pdf-{item[1]}",
-                        item[2], item[3], item[4]
-                    ))
+                    all_results.append((item[0], f"pdf-{item[1]}", item[2], item[3], item[4]))
         if html_regex.strip():
-            for item in apply_smart_regex(
-                bodies, html_regex.strip(), exclude_keywords
-            ):
+            for item in apply_smart_regex(bodies, html_regex.strip(), exclude_keywords):
                 if item[0] not in seen:
                     seen.add(item[0])
-                    all_results.append((
-                        item[0], f"html-{item[1]}",
-                        item[2], item[3], item[4]
-                    ))
-
-        all_results.sort(
-            key=lambda x: x[0].split('/')[-1].lower()
-        )
+                    all_results.append((item[0], f"html-{item[1]}", item[2], item[3], item[4]))
+        all_results.sort(key=lambda x: x[0].split('/')[-1].lower())
         st.session_state.filtered_links = all_results
         st.rerun()
 
-    # Display
+    # Display table
     for i, item in enumerate(st.session_state.filtered_links, 1):
         url = item[0]
         matched_by = item[1]
         title = item[3] if len(item) > 3 and item[3] else ""
         date = item[4] if len(item) > 4 and item[4] else ""
-
-        fname = url.split('/')[-1].split('?')[0]
-        if not fname:
-            fname = url[:50]
+        fname = url.split('/')[-1].split('?')[0] or url[:50]
 
         c1, c2, c3, c4, c5 = st.columns([0.3, 2.5, 1.2, 3.5, 1.5])
         with c1:
             st.text(f"{i}.")
         with c2:
-            display = title if title else fname
-            if len(display) > 50:
-                display = display[:47] + "..."
-            st.text(f"📄 {display}")
+            d = title if title else fname
+            if len(d) > 50:
+                d = d[:47] + "..."
+            st.text(f"📄 {d}")
         with c3:
             st.text(f"📅 {date}" if date else "📅 —")
         with c4:
@@ -1094,37 +1216,45 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
     st.markdown("---")
     st.header("⬇️ Download")
 
-    d1, d2, d3, d4 = st.columns(4)
+    d1, d2, d3, d4, d5 = st.columns(5)
 
     with d1:
-        html_out = generate_html_links(
-            st.session_state.filtered_links
-        )
+        txt_out = generate_html_links_txt(st.session_state.filtered_links)
         st.download_button(
-            '📝 HTML Links (.txt)',
-            data=html_out,
-            file_name=(
-                f"links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            ),
+            '📝 Links (.txt)',
+            data=txt_out,
+            file_name=f"links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             mime="text/plain",
             type="primary",
-            help='<a href="URL">Title | Date</a> format'
+            help='<a href="URL">Title | Date</a>'
         )
 
     with d2:
-        plain = "\n".join(
-            u for u, *_ in st.session_state.filtered_links
+        html_file = generate_html_file(
+            st.session_state.filtered_links,
+            source=uploaded_file.name if uploaded_file else "",
+            inc_kw=include_keywords,
+            pdf_regex=pdf_regex,
+            html_regex=html_regex
         )
         st.download_button(
-            "🔗 Plain URLs (.txt)",
-            data=plain,
-            file_name=(
-                f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            ),
-            mime="text/plain"
+            "🌐 HTML File (.html)",
+            data=html_file,
+            file_name=f"links_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html",
+            mime="text/html",
+            help="Interactive page with search, sort, copy"
         )
 
     with d3:
+        plain = "\n".join(u for u, *_ in st.session_state.filtered_links)
+        st.download_button(
+            "🔗 URLs (.txt)",
+            data=plain,
+            file_name=f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
+            mime="text/plain"
+        )
+
+    with d4:
         report = generate_full_report(
             st.session_state.filtered_links,
             uploaded_file.name if uploaded_file else "unknown",
@@ -1132,34 +1262,24 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             pdf_regex, html_regex
         )
         st.download_button(
-            "📋 Full Report (.txt)",
+            "📋 Report (.txt)",
             data=report,
-            file_name=(
-                f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-            ),
+            file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             mime="text/plain"
         )
 
-    with d4:
+    with d5:
         csv_lines = ["index,title,date,url,matched_by"]
-        for i, item in enumerate(
-            st.session_state.filtered_links, 1
-        ):
+        for i, item in enumerate(st.session_state.filtered_links, 1):
             url = item[0]
-            title = (item[3] if len(item) > 3 and item[3]
-                     else "").replace('"', "'")
-            date = (item[4] if len(item) > 4 and item[4]
-                    else "").replace('"', "'")
+            title = (item[3] if len(item) > 3 and item[3] else "").replace('"', "'")
+            date = (item[4] if len(item) > 4 and item[4] else "").replace('"', "'")
             mb = item[1].replace('"', "'")
-            csv_lines.append(
-                f'{i},"{title}","{date}","{url}","{mb}"'
-            )
+            csv_lines.append(f'{i},"{title}","{date}","{url}","{mb}"')
         st.download_button(
             "📊 CSV (.csv)",
             data="\n".join(csv_lines),
-            file_name=(
-                f"data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            ),
+            file_name=f"data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             mime="text/csv"
         )
 
@@ -1167,30 +1287,20 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
     st.markdown("---")
     st.subheader("📋 Copy-Paste")
 
-    tab_html, tab_plain = st.tabs([
-        "HTML Links", "Plain URLs"
-    ])
+    tab_html, tab_plain = st.tabs(["HTML Links", "Plain URLs"])
 
     with tab_html:
-        html_out = generate_html_links(
-            st.session_state.filtered_links
-        )
         st.text_area(
-            '<a href="URL">Title | Date</a> format',
-            value=html_out,
-            height=250,
-            key="copy_html"
+            '<a href="URL">Title | Date</a>',
+            value=generate_html_links_txt(st.session_state.filtered_links),
+            height=250, key="copy_html"
         )
 
     with tab_plain:
-        plain = "\n".join(
-            u for u, *_ in st.session_state.filtered_links
-        )
         st.text_area(
             "Plain URLs",
-            value=plain,
-            height=250,
-            key="copy_plain"
+            value="\n".join(u for u, *_ in st.session_state.filtered_links),
+            height=250, key="copy_plain"
         )
 
 
@@ -1201,8 +1311,7 @@ if st.session_state.har_loaded:
 
     if st.session_state.body_texts:
         body_search = st.text_input(
-            "🔍 Search",
-            placeholder="communique, .pdf, investor...",
+            "🔍 Search", placeholder="communique, .pdf, investor...",
             key="bsearch"
         )
         if body_search:
@@ -1210,18 +1319,13 @@ if st.session_state.har_loaded:
             for mime, req_url, body in st.session_state.body_texts:
                 if body_search.lower() in body.lower():
                     count += 1
-                    with st.expander(
-                        f"{count}. [{mime[:30]}] {req_url[:80]}"
-                    ):
-                        idx = body.lower().find(
-                            body_search.lower()
-                        )
+                    with st.expander(f"{count}. [{mime[:30]}] {req_url[:80]}"):
+                        idx = body.lower().find(body_search.lower())
                         start = max(0, idx - 300)
                         end = min(len(body), idx + 500)
                         st.code(body[start:end], language="html")
                     if count >= 15:
                         break
-
             if count:
                 st.success(f"Found in {count} response(s)")
             else:
@@ -1231,6 +1335,7 @@ if st.session_state.har_loaded:
         with st.expander("📋 Parse Log"):
             for e in st.session_state.extraction_log:
                 st.text(e)
+
 
 # ─── Sidebar ───
 with st.sidebar:
@@ -1248,17 +1353,18 @@ with st.sidebar:
 
     st.markdown("---")
     st.markdown("""
-    ### Output Format
-    ```
-    <a href="URL">Title | Date</a>
-    ```
-    
-    ### Dates Extracted From
-    - Nearby HTML elements
-    - `<time>` tags
-    - JSON date fields
-    - URL path (/2025/01/)
-    - Filename (Report-March2024)
+    ### Download Formats
+    - **📝 Links .txt** → `<a href>` tags
+    - **🌐 HTML .html** → Interactive page
+    - **🔗 URLs .txt** → Plain URLs
+    - **📋 Report .txt** → Full details
+    - **📊 CSV** → For Excel
+
+    ### HTML File Features
+    - 🔍 Search box
+    - ↕️ Sortable columns
+    - 📋 Copy buttons
+    - 💾 Export filtered
     """)
 
     st.markdown("---")
