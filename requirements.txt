@@ -1,2 +1,2 @@
 streamlit
-beautifulsoup4
+beautifulsoup
