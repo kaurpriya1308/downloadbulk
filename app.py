@@ -104,7 +104,6 @@ def clean_url(url):
 
 # ─────────────────────────────────────────────
 # Extract metadata (title + date) from context
-# NOTE: local vars renamed to avoid shadowing `st` (streamlit)
 # ─────────────────────────────────────────────
 def extract_metadata_from_context(body, url, match_start):
     title = ""
@@ -115,7 +114,7 @@ def extract_metadata_from_context(body, url, match_start):
     url_tail = url.split('/')[-1] if '/' in url else url
     et = re.escape(url_tail)
 
-    # TITLE — regex passes
+    # TITLE
     for pat in [
         r'<a[^>]*href\s*=\s*["\'][^"\']*' + et + r'[^"\']*["\'][^>]*>\s*(.*?)\s*</a>',
         r'href\s*=\s*["\'][^"\']*' + et + r'[^"\']*["\'][^>]*>\s*([^<]+)',
@@ -170,34 +169,33 @@ def extract_metadata_from_context(body, url, match_start):
         except re.error:
             pass
 
-    # TITLE — BeautifulSoup pass (all local vars renamed, no `st` usage)
     if not title:
         try:
-            soup_ctx = BeautifulSoup(context, 'html.parser')
-            for atag in soup_ctx.find_all('a', href=True):
-                href_val = atag.get('href', '')
-                if url_tail in href_val or url in href_val:
-                    link_text = atag.get_text(strip=True)
-                    if link_text and len(link_text) > 2:
-                        title = link_text
+            soup = BeautifulSoup(context, 'html.parser')
+            for a in soup.find_all('a', href=True):
+                h = a.get('href', '')
+                if url_tail in h or url in h:
+                    lt = a.get_text(strip=True)
+                    if lt and len(lt) > 2:
+                        title = lt
                         break
-                    title_attr = atag.get('title', '').strip()
-                    if title_attr:
-                        title = title_attr
+                    t = a.get('title', '').strip()
+                    if t:
+                        title = t
                         break
             if not title:
-                for atag in soup_ctx.find_all('a', href=True):
-                    href_val = atag.get('href', '')
-                    if url_tail in href_val or url in href_val:
-                        parent = atag.parent
+                for a in soup.find_all('a', href=True):
+                    h = a.get('href', '')
+                    if url_tail in h or url in h:
+                        parent = a.parent
                         while parent and parent.name:
                             for sib in parent.children:
-                                if sib == atag:
+                                if sib == a:
                                     continue
                                 if hasattr(sib, 'get_text'):
-                                    sib_text = sib.get_text(strip=True)
-                                    if sib_text and 3 < len(sib_text) < 200 and not sib_text.startswith('http'):
-                                        title = sib_text
+                                    st2 = sib.get_text(strip=True)
+                                    if st2 and 3 < len(st2) < 200 and not st2.startswith('http'):
+                                        title = st2
                                         break
                             if title:
                                 break
@@ -207,7 +205,7 @@ def extract_metadata_from_context(body, url, match_start):
         except Exception:
             pass
 
-    # DATE — regex pass
+    # DATE
     dm = DATE_REGEX.findall(context)
     if dm:
         date = dm[0].strip()
@@ -228,26 +226,25 @@ def extract_metadata_from_context(body, url, match_start):
             except re.error:
                 pass
 
-    # DATE — BeautifulSoup pass (no `st` usage)
     if not date:
         try:
-            soup_ctx2 = BeautifulSoup(context, 'html.parser')
-            for time_tag in soup_ctx2.find_all('time'):
-                dt_attr = time_tag.get('datetime', '')
-                if dt_attr:
-                    date = dt_attr.strip()
+            soup = BeautifulSoup(context, 'html.parser')
+            for tt in soup.find_all('time'):
+                dt = tt.get('datetime', '')
+                if dt:
+                    date = dt.strip()
                     break
-                time_text = time_tag.get_text(strip=True)
-                if time_text:
-                    date = time_text
+                t = tt.get_text(strip=True)
+                if t:
+                    date = t
                     break
             if not date:
-                for tag in soup_ctx2.find_all(
+                for tag in soup.find_all(
                     class_=re.compile(r'date|time|publish|posted', re.IGNORECASE)
                 ):
-                    tag_text = tag.get_text(strip=True)
-                    if tag_text and len(tag_text) < 50 and DATE_REGEX.search(tag_text):
-                        date = tag_text
+                    t = tag.get_text(strip=True)
+                    if t and len(t) < 50 and DATE_REGEX.search(t):
+                        date = t
                         break
         except Exception:
             pass
@@ -304,7 +301,7 @@ def extract_urls_from_html(html_string, base_url=""):
     if not html_string or len(html_string) < 10:
         return urls
     try:
-        soup_html = BeautifulSoup(html_string, 'html.parser')
+        soup = BeautifulSoup(html_string, 'html.parser')
     except Exception:
         return urls
     for attr in [
@@ -312,7 +309,7 @@ def extract_urls_from_html(html_string, base_url=""):
         'data-file', 'data-download', 'data-pdf', 'data-link',
         'action', 'content',
     ]:
-        for tag in soup_html.find_all(attrs={attr: True}):
+        for tag in soup.find_all(attrs={attr: True}):
             val = tag.get(attr, '').strip()
             if val and not val.startswith(('#', 'javascript:', 'mailto:')):
                 if val.startswith('http'):
@@ -321,11 +318,11 @@ def extract_urls_from_html(html_string, base_url=""):
                     urls.add('https:' + val)
                 elif val.startswith('/') and base_url:
                     urls.add(urljoin(base_url, val))
-    for tag in soup_html.find_all(True):
+    for tag in soup.find_all(True):
         if tag.string:
             urls.update(re.findall(r'https?://[^\s<>"\']+', tag.string))
     for attr in ['onclick', 'onmousedown']:
-        for tag in soup_html.find_all(attrs={attr: True}):
+        for tag in soup.find_all(attrs={attr: True}):
             urls.update(re.findall(r'["\']?(https?://[^\s"\'<>)]+)', tag.get(attr, '')))
     return urls
 
@@ -370,7 +367,6 @@ def parse_har_bodies(har_content):
 
 def extract_html_from_json(data):
     html_strings = []
-
     def recurse(obj):
         if isinstance(obj, dict):
             for v in obj.values():
@@ -384,16 +380,14 @@ def extract_html_from_json(data):
                     check(item)
                 else:
                     recurse(item)
-
     def check(value):
         if not value or len(value) < 20:
             return
         indicators = ['<a ', '<a\n', '<div', '<span', '<td', '<tr',
-                      '<table', '<p ', '<p>', '<li', 'href=', 'src=']
+                       '<table', '<p ', '<p>', '<li', 'href=', 'src=']
         vl = value.lower()
         if any(ind in vl for ind in indicators):
             html_strings.append(value)
-
     recurse(data)
     return html_strings
 
@@ -859,10 +853,13 @@ if uploaded_file:
         st.session_state.har_loaded = True
 
 
-# ─── Results ───
+# ─── Results (Downloads FIRST, then collapsible details) ───
 if st.session_state.har_loaded and st.session_state.filtered_links:
     total = len(st.session_state.filtered_links)
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # METRICS — always visible
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     st.markdown("---")
     m1, m2, m3, m4 = st.columns(4)
     with m1:
@@ -874,6 +871,9 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
     with m4:
         st.metric("📊 Total", total)
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # DOWNLOADS — always visible, RIGHT AFTER metrics
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     st.markdown("---")
     st.header(f"⬇️ Download {total} URLs")
 
@@ -888,6 +888,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             type="primary",
             help='<a href="URL">Title | Date</a>'
         )
+
     with d2:
         st.download_button(
             "🌐 HTML Page (.html)",
@@ -902,6 +903,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             mime="text/html",
             help="Interactive page with search, sort, copy"
         )
+
     with d3:
         st.download_button(
             "🔗 URLs (.txt)",
@@ -909,6 +911,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             file_name=f"urls_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             mime="text/plain"
         )
+
     with d4:
         st.download_button(
             "📋 Report (.txt)",
@@ -921,6 +924,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             file_name=f"report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             mime="text/plain"
         )
+
     with d5:
         csv_lines = ["index,title,date,url,matched_by"]
         for i, item in enumerate(st.session_state.filtered_links, 1):
@@ -935,6 +939,9 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             mime="text/csv"
         )
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # COPY-PASTE — collapsible
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     with st.expander("📋 Copy-Paste Ready", expanded=False):
         tab_html, tab_plain = st.tabs(["HTML Links", "Plain URLs"])
         with tab_html:
@@ -950,7 +957,12 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
                 height=200, key="copy_plain"
             )
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # FOUND LINKS — collapsible, CLOSED by default
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     with st.expander(f"📄 View All {total} Found Links", expanded=False):
+
+        # Re-filter button inside the expander
         if st.button("🔄 Re-apply Filters", key="refilter"):
             bodies = st.session_state.body_texts
             all_results = []
@@ -974,6 +986,7 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             st.session_state.filtered_links = all_results
             st.rerun()
 
+        # Display each link
         for i, item in enumerate(st.session_state.filtered_links, 1):
             url = item[0]
             matched_by = item[1]
@@ -996,6 +1009,9 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             with c5:
                 st.caption(matched_by)
 
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    # DEBUG — collapsible, CLOSED by default
+    # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
     with st.expander("🔧 Debug: Search Response Bodies", expanded=False):
         if st.session_state.body_texts:
             body_search = st.text_input(
@@ -1025,17 +1041,21 @@ if st.session_state.har_loaded and st.session_state.filtered_links:
             for e in st.session_state.extraction_log:
                 st.text(e)
 
+
 # ─── Sidebar ───
 with st.sidebar:
     st.header("📖 Quick Reference")
+
     st.markdown("### Keywords")
     st.code(".pdf", language="text")
     st.code("communique-de-presse", language="text")
     st.code(".pdf|.xlsx|annual-report", language="text")
+
     st.markdown("### Regex")
     st.code(r'href="([^"]*investor[^"]*)"', language="text")
     st.code(r'communique-de-presse', language="text")
     st.code(r'<td[^>]*>(https?://[^<]+)</td>', language="text")
+
     st.markdown("---")
     st.markdown("""
     ### Download Formats
@@ -1051,6 +1071,7 @@ with st.sidebar:
     - 📋 Copy buttons
     - 💾 Export filtered
     """)
+
     st.markdown("---")
     if st.button("🗑️ Clear"):
         for k in list(st.session_state.keys()):
